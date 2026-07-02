@@ -1,7 +1,7 @@
 /**
  * @file chunkVersionManager.js
- * @description In-memory Optimistic Concurrency Control (OCC) version store
- * for canvas chunks.
+ * @description Distributed Optimistic Concurrency Control (OCC) version store
+ * for canvas chunks, backed by Redis.
  *
  * ── Why OCC (Optimistic Locking) and NOT PCC (Pessimistic Locking)? ──────────
  *
@@ -14,159 +14,204 @@
  *
  * Optimistic Concurrency Control assumes conflicts are the exception, not the
  * rule.  Each client tracks the last-known version of every chunk it has
- * painted.  The Gateway checks the version in O(1) (a single Map lookup) and
- * either:
+ * painted.  The Gateway checks the version in O(1) and either:
  *   • accepts the stroke (versions match) — bumps the version and continues.
  *   • rejects the stroke (versions diverge) — returns a conflict_event so the
  *     client can update its local version and re-paint.
  *
- * The critical section is a synchronous Map lookup + increment — microseconds,
- * not milliseconds.  Because Node.js is single-threaded, no explicit mutex is
- * needed: two stroke_events are never processed simultaneously in the same
- * process.
+ * ── Why Redis for Phase 7? ────────────────────────────────────────────────────
  *
- * ── Phase 7 hook ─────────────────────────────────────────────────────────────
- * When scaling to multiple Gateway instances, replace the `versionMap` with
- * Redis INCR + CAS (WATCH / MULTI / EXEC) so version state is shared across
- * nodes.  The public API of this module remains identical — callers need not
- * change.
+ * The original in-memory Map worked correctly when the Gateway ran as a single
+ * process.  With 3 replicas behind an Nginx load balancer, each process has its
+ * own version counter: instance A accepts version 5→6, but instance B still
+ * reads 5 and also accepts a conflicting stroke at 5→6.  OCC is broken.
+ *
+ * Redis fixes this with a single shared version store.  The critical section
+ * (compare-and-increment) is implemented as a Lua script, which Redis executes
+ * atomically — no two scripts for the same key can interleave.  This gives the
+ * same correctness guarantee as the single-process synchronous Map lookup, now
+ * across N replicas.
+ *
+ * ── Why Lua scripts and not WATCH/MULTI/EXEC? ────────────────────────────────
+ *
+ * WATCH/MULTI/EXEC requires multiple round-trips to Redis and client-side retry
+ * logic on transaction abort.  A Lua script executes atomically in a single
+ * round-trip, making it both simpler and faster on this hot path (every accepted
+ * stroke triggers a version check).
  *
  * Responsibilities (SRP):
- *  - Maintain a per-(roomId, chunkId) version counter in memory.
+ *  - Maintain a per-(roomId, chunkId) version counter in Redis.
  *  - Seed versions from the database on Gateway restart (via initChunk).
- *  - Expose tryAcceptStroke() as the single OCC decision point.
- *  - Clean up memory when a room becomes empty.
+ *  - Expose tryAcceptStroke() as the single async OCC decision point.
+ *  - Version keys expire automatically via TTL — clearRoom is a no-op.
  */
 
+const { redis } = require('./redisClient');
+
 /**
- * Composite key builder for the version map.
+ * TTL applied to every version key on write.
+ * 24 hours is sufficient for a room session; keys are auto-purged by Redis
+ * when they expire, preventing unbounded key accumulation without requiring
+ * explicit cleanup calls that would be unsafe in a multi-instance deployment.
+ */
+const VERSION_KEY_TTL_SECONDS = 86_400;
+
+/**
+ * Redis key for a chunk version counter.
  *
  * @param {string} roomId
  * @param {string} chunkId
  * @returns {string}
  */
-function buildKey(roomId, chunkId) {
-  return `${roomId}::${chunkId}`;
+function versionKey(roomId, chunkId) {
+  return `chunk:${roomId}:${chunkId}:version`;
 }
 
 /**
- * In-memory version store.
- * Keys are composite "roomId::chunkId" strings; values are the current
- * version number (BIGINT-compatible JS integer).
+ * Lua script: set the version key to Math.max(current, candidate) atomically.
  *
- * @type {Map<string, number>}
+ * Called when a client joins and hydrates versions from the DB.  The Lua
+ * script prevents a stale DB value from overwriting a version that another
+ * instance has already advanced in Redis — the higher value always wins.
+ *
+ * KEYS[1] — the Redis key for this chunk's version.
+ * ARGV[1] — the candidate version (from the DB).
+ * ARGV[2] — TTL in seconds (refreshed on every write).
+ *
+ * Returns the version stored after the operation.
  */
-const versionMap = new Map();
+const INIT_CHUNK_SCRIPT = `
+  local current = tonumber(redis.call('GET', KEYS[1]))
+  local candidate = tonumber(ARGV[1])
+  local ttl = tonumber(ARGV[2])
+  if not current or candidate > current then
+    redis.call('SET', KEYS[1], candidate, 'EX', ttl)
+    return candidate
+  else
+    redis.call('EXPIRE', KEYS[1], ttl)
+    return current
+  end
+`;
 
 /**
- * Seeds the in-memory version for a specific chunk.
+ * Lua script: atomic compare-and-increment for OCC.
  *
- * Called in two scenarios:
- *  1. A client joins a room — versions are hydrated from the DB rows returned
- *     by fetchRoomChunks().
- *  2. A stroke is accepted for a brand-new chunk that has never been persisted
- *     — the version starts at 0 and is immediately bumped by tryAcceptStroke.
+ * Checks whether the stored version equals the client's version.
+ *  - Match   → increments the version and returns { 1, newVersion }.
+ *  - Mismatch → returns { 0, currentVersion } without modifying Redis.
  *
- * Idempotent: calling initChunk on an already-tracked chunk updates the stored
- * version.  This is intentional so that a DB-authoritative version always wins
- * over a stale in-memory value after a Gateway restart where some clients
- * reconnect in parallel.
+ * Redis executes Lua scripts atomically: no two concurrent EVAL calls for the
+ * same key can interleave, giving the same correctness guarantee as the former
+ * single-process synchronous Map check across all Gateway replicas.
+ *
+ * KEYS[1] — the Redis key for this chunk's version.
+ * ARGV[1] — the client's reported version.
+ * ARGV[2] — TTL in seconds (refreshed on every accepted stroke).
+ */
+const TRY_ACCEPT_SCRIPT = `
+  local raw = redis.call('GET', KEYS[1])
+  local stored = raw and tonumber(raw) or 0
+  local client = tonumber(ARGV[1])
+  local ttl = tonumber(ARGV[2])
+  if stored == client then
+    local newVersion = stored + 1
+    redis.call('SET', KEYS[1], newVersion, 'EX', ttl)
+    return {1, newVersion}
+  else
+    return {0, stored}
+  end
+`;
+
+/**
+ * Seeds the Redis version for a specific chunk, taking the maximum of the
+ * current Redis value and the DB-persisted value.
+ *
+ * Idempotent and safe to call concurrently from multiple Gateway replicas —
+ * the Lua script ensures the higher value always wins, so a stale DB read
+ * from one instance never downgrades a version already advanced by another.
  *
  * @param {string} roomId   - Room that owns the chunk.
  * @param {string} chunkId  - Chunk identifier (e.g. "0_0").
  * @param {number} version  - The version number to seed (typically from DB).
+ * @returns {Promise<void>}
  */
-function initChunk(roomId, chunkId, version) {
-  const key = buildKey(roomId, chunkId);
-  const inMemoryVersion = versionMap.get(key) ?? 0;
-  const dbVersion = Number(version);
-
-  // Use Math.max so a DB read never downgrades the in-memory version.
-  // The write-batcher flushes asynchronously (every BATCH_FLUSH_INTERVAL_MS),
-  // so the DB version may legitimately lag behind the in-memory state when a
-  // second client joins mid-session.  Overwriting with the stale DB value
-  // would cause clients whose chunkVersions map is ahead to receive spurious
-  // conflict_events on their next stroke.
-  versionMap.set(key, Math.max(inMemoryVersion, dbVersion));
+async function initChunk(roomId, chunkId, version) {
+  const key = versionKey(roomId, chunkId);
+  await redis.eval(
+    INIT_CHUNK_SCRIPT,
+    1,
+    key,
+    String(Number(version)),
+    String(VERSION_KEY_TTL_SECONDS),
+  );
 }
 
 /**
  * Atomically validates and accepts (or rejects) an incoming stroke based on
  * its client-reported version.
  *
- * OCC decision logic:
- *  - If the client's version matches the stored version → the client has an
- *    up-to-date view of this chunk.  The stroke is accepted and the version
- *    is incremented immediately (before any async I/O) so the next concurrent
- *    stroke in the event loop sees the bumped value.
- *  - If the client's version is lower than the stored version → another stroke
- *    was accepted after the client last synced.  The stroke is rejected and the
- *    current authoritative version is returned so the client can reconcile.
- *
- * Note: because Node.js event processing is single-threaded, the check-and-
- * increment sequence below is effectively atomic — no two stroke_events can
- * interleave within a single synchronous call stack.
+ * OCC decision logic (enforced in Redis via Lua, atomically across all
+ * Gateway replicas):
+ *  - versions match   → stroke accepted, version incremented.
+ *  - versions differ  → stroke rejected, current version returned.
  *
  * @param {string} roomId        - Room that owns the chunk.
  * @param {string} chunkId       - Chunk the stroke targets.
  * @param {number} clientVersion - The version the client believed was current.
- * @returns {{ accepted: boolean, currentVersion: number }}
+ * @returns {Promise<{ accepted: boolean, currentVersion: number }>}
  *   `accepted` is true if the stroke was accepted and the version was bumped.
  *   `currentVersion` is the authoritative version after the operation:
  *     - on accept: the newly incremented version.
- *     - on reject: the version the Gateway has (client should sync to this).
+ *     - on reject: the current version the client should sync to.
  */
-function tryAcceptStroke(roomId, chunkId, clientVersion) {
-  const key = buildKey(roomId, chunkId);
+async function tryAcceptStroke(roomId, chunkId, clientVersion) {
+  const key = versionKey(roomId, chunkId);
+  const result = await redis.eval(
+    TRY_ACCEPT_SCRIPT,
+    1,
+    key,
+    String(clientVersion),
+    String(VERSION_KEY_TTL_SECONDS),
+  );
 
-  // Default to 0 for chunks that have never been painted — this handles
-  // the very first stroke on a fresh chunk without requiring an explicit init.
-  const storedVersion = versionMap.get(key) ?? 0;
-
-  if (clientVersion !== storedVersion) {
-    // Conflict: client is operating on a stale version of this chunk.
-    return { accepted: false, currentVersion: storedVersion };
-  }
-
-  // Accept: bump the version atomically (synchronous — no await between
-  // the read above and this write).
-  const newVersion = storedVersion + 1;
-  versionMap.set(key, newVersion);
-
-  return { accepted: true, currentVersion: newVersion };
+  return {
+    accepted: result[0] === 1,
+    currentVersion: Number(result[1]),
+  };
 }
 
 /**
- * Returns the current in-memory version for a chunk.
- * Returns 0 if the chunk has not been seeded yet.
+ * Returns the current version for a chunk from Redis.
+ * Returns 0 if the key does not exist (chunk never painted).
  *
  * @param {string} roomId  - Room that owns the chunk.
  * @param {string} chunkId - Chunk identifier.
- * @returns {number}
+ * @returns {Promise<number>}
  */
-function getVersion(roomId, chunkId) {
-  return versionMap.get(buildKey(roomId, chunkId)) ?? 0;
+async function getVersion(roomId, chunkId) {
+  const raw = await redis.get(versionKey(roomId, chunkId));
+  return raw ? Number(raw) : 0;
 }
 
 /**
- * Removes all version entries for a given room from the in-memory map.
+ * No-op in Phase 7 (multi-instance deployment).
  *
- * Should be called when the last client leaves a room to prevent unbounded
- * memory growth in long-running Gateway processes with many transient rooms.
- * Versions are re-hydrated from the DB when the room is next joined.
+ * ── Design decision ──────────────────────────────────────────────────────────
+ * In the single-process implementation, clearRoom deleted in-memory entries
+ * when the last local client left a room.  In a multi-instance deployment,
+ * this is unsafe: instance A's local room becoming empty does not mean the
+ * room is globally empty — instances B and C may still have active clients
+ * processing strokes against the same Redis version keys.  Deleting those
+ * keys from instance A would reset versions to 0, corrupting OCC for other
+ * instances.
  *
- * @param {string} roomId - Room whose entries should be purged.
+ * Version keys are managed via TTL (VERSION_KEY_TTL_SECONDS = 24 h) and are
+ * auto-purged by Redis.  No explicit cleanup is needed or safe here.
+ *
+ * @param {string} _roomId - Unused in Phase 7.
  */
-function clearRoom(roomId) {
-  const prefix = `${roomId}::`;
-
-  for (const key of versionMap.keys()) {
-    if (key.startsWith(prefix)) {
-      versionMap.delete(key);
-    }
-  }
-
-  console.log(`[chunkVersionManager] version entries cleared for room=${roomId}`);
+function clearRoom(_roomId) {
+  // Intentional no-op — see JSDoc above.
 }
 
 module.exports = { initChunk, tryAcceptStroke, getVersion, clearRoom };

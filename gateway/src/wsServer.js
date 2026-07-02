@@ -16,6 +16,7 @@ const { WebSocketServer } = require('ws');
 const { handleMessage } = require('./messageHandler');
 const roomManager = require('./roomManager');
 const chunkVersionManager = require('./chunkVersionManager');
+const roomBroadcastBus = require('./roomBroadcastBus');
 
 /**
  * Attaches a WebSocket server to an existing Node.js HTTP server instance.
@@ -78,7 +79,15 @@ function handleClientDisconnect(ws) {
   // the next time any client joins this room, preventing unbounded memory
   // growth in long-running Gateway processes with many transient rooms.
   if (remainingCount === 0) {
+    // clearRoom is a no-op in Phase 7 (Redis keys expire via TTL).
     chunkVersionManager.clearRoom(roomId);
+
+    // Unsubscribe from the room's RabbitMQ fanout exchange when this instance
+    // has no more local clients.  Other instances may still be subscribed;
+    // the exchange persists until the last binding drops (autoDelete).
+    roomBroadcastBus.unsubscribeFromRoom(roomId).catch((err) => {
+      console.error(`[wsServer] room bus unsubscribe failed for room=${roomId}: ${err.message}`);
+    });
   }
 
   roomManager.broadcastToRoom(roomId, {

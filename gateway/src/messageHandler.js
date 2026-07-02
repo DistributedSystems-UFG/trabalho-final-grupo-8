@@ -21,6 +21,7 @@ const writeBatcher = require('./writeBatcher');
 const { fetchRoomChunks } = require('./db/chunkRepository');
 const chunkVersionManager = require('./chunkVersionManager');
 const simulationBatcher = require('./simulationBatcher');
+const roomBroadcastBus = require('./roomBroadcastBus');
 
 /**
  * Sends a structured error message back to a single client.
@@ -61,6 +62,20 @@ function handleJoinRoom(ws, payload, roomManager) {
 
   console.log(`[gateway] user=${userId} joined room=${roomId} (${clientCount} clients)`);
 
+  // Subscribe to this room's fanout exchange when the first client on this
+  // instance joins.  The callback broadcasts any cross-instance messages
+  // (strokes from other Gateway replicas) to all local WebSocket clients.
+  // Fire-and-forget: the subscription is typically ready within milliseconds.
+  // The rare race where a remote stroke arrives before subscription completes
+  // is acceptable — local strokes and persistence are unaffected.
+  if (clientCount === 1) {
+    roomBroadcastBus.subscribeToRoom(roomId, (payload) => {
+      roomManager.broadcastToRoom(roomId, payload);
+    }).catch((err) => {
+      console.error(`[gateway] room bus subscribe failed for room=${roomId}: ${err.message}`);
+    });
+  }
+
   // Acknowledge the join to the requesting client.
   ws.send(JSON.stringify({ type: 'room_joined', roomId, clientCount }));
 
@@ -72,13 +87,14 @@ function handleJoinRoom(ws, payload, roomManager) {
   // This is the correct pattern for distributed state restoration: the join
   // confirmation is decoupled from the (potentially slow) persistence read.
   fetchRoomChunks(roomId)
-    .then((chunks) => {
-      // Hydrate the in-memory OCC version map from the persisted DB versions.
-      // This is critical on Gateway restart: without hydration, the in-memory
-      // version for every chunk defaults to 0, causing every client with a
-      // non-zero version to receive a spurious conflict_event.
+    .then(async (chunks) => {
+      // Hydrate the Redis OCC version store from the persisted DB versions.
+      // initChunk is now async (Redis SET via Lua) — awaited sequentially here.
+      // This is critical on Gateway restart: without hydration, the Redis key
+      // for a chunk defaults to 0, causing clients with a non-zero version to
+      // receive spurious conflict_events on their first stroke.
       for (const chunk of chunks) {
-        chunkVersionManager.initChunk(roomId, chunk.chunkId, chunk.version ?? 0);
+        await chunkVersionManager.initChunk(roomId, chunk.chunkId, chunk.version ?? 0);
       }
 
       if (chunks.length === 0) return; // brand-new room — nothing to restore
@@ -132,7 +148,7 @@ function handleJoinRoom(ws, payload, roomManager) {
  * @param {number} payload.version - Client's last-known version for the chunk.
  * @param {object} roomManager - The roomManager module instance.
  */
-function handleStrokeEvent(ws, payload, roomManager) {
+async function handleStrokeEvent(ws, payload, roomManager) {
   const { roomId, userId, x, y, color, brushSize, timestamp, chunkId } = payload;
 
   const missingFields = ['roomId', 'userId', 'x', 'y', 'color', 'brushSize', 'timestamp', 'chunkId']
@@ -148,7 +164,9 @@ function handleStrokeEvent(ws, payload, roomManager) {
   const clientVersion = typeof payload.version === 'number' ? payload.version : 0;
 
   // ── OCC check ────────────────────────────────────────────────────────────
-  const { accepted, currentVersion } = chunkVersionManager.tryAcceptStroke(
+  // tryAcceptStroke is now async: it executes a Lua CAS script in Redis,
+  // which is atomic across all Gateway replicas (Phase 7).
+  const { accepted, currentVersion } = await chunkVersionManager.tryAcceptStroke(
     roomId,
     chunkId,
     clientVersion
@@ -187,6 +205,18 @@ function handleStrokeEvent(ws, payload, roomManager) {
     { type: 'stroke_event', roomId, userId, x, y, color, brushSize, timestamp, chunkId, version: currentVersion },
     ws
   );
+
+  // Publish the accepted stroke to the room's RabbitMQ fanout exchange so
+  // Gateway instances B and C can broadcast it to their local WebSocket
+  // clients.  The originating instance (this one) is excluded via
+  // originInstanceId deduplication in roomBroadcastBus.
+  // Fire-and-forget: a fanout publish failure does not affect local clients
+  // or persistence — only cross-instance delivery is degraded.
+  roomBroadcastBus.publishToRoom(roomId, {
+    type: 'stroke_event', roomId, userId, x, y, color, brushSize, timestamp, chunkId, version: currentVersion,
+  }).catch((err) => {
+    console.error(`[messageHandler] room fanout publish failed room=${roomId}: ${err.message}`);
+  });
 
   // Queue the accepted stroke for async persistence via the write-batcher.
   // The version is threaded through so the DB mirrors the in-memory state
@@ -229,7 +259,12 @@ function handleMessage(ws, rawMessage, roomManager) {
       break;
 
     case 'stroke_event':
-      handleStrokeEvent(ws, payload, roomManager);
+      // handleStrokeEvent is async (awaits Redis OCC). Errors are caught here
+      // to prevent unhandled promise rejections from crashing the process.
+      handleStrokeEvent(ws, payload, roomManager).catch((err) => {
+        console.error(`[messageHandler] unhandled error in stroke_event: ${err.message}`);
+        sendError(ws, 'Internal server error processing stroke.');
+      });
       break;
 
     default:

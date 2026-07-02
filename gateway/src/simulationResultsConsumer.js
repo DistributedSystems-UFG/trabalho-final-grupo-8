@@ -23,6 +23,7 @@
  */
 
 const { getConsumeChannel, RESULTS_QUEUE_NAME } = require('./rabbitClient');
+const roomBroadcastBus = require('./roomBroadcastBus');
 
 /**
  * Starts the simulation results consumer on the shared consume channel.
@@ -58,6 +59,18 @@ function startSimulationResultsConsumer(roomManager) {
           type: 'pixel_update',
           chunkId,
           pixels,
+        });
+
+        // Publish pixel_update to the room's fanout exchange so Gateway
+        // instances that did not consume this simulation_result (competing
+        // consumers — only one instance gets each message) also deliver the
+        // fluid diffusion update to their local WebSocket clients.
+        roomBroadcastBus.publishToRoom(roomId, {
+          type: 'pixel_update',
+          chunkId,
+          pixels,
+        }).catch((err) => {
+          console.error(`[simulationResultsConsumer] room fanout publish failed room=${roomId}: ${err.message}`);
         });
 
         console.log(

@@ -175,6 +175,23 @@ function getConsumeChannel() {
 }
 
 /**
+ * Creates and returns a new AMQP channel on the shared connection.
+ *
+ * Used by roomBroadcastBus to create dedicated per-room consumer channels
+ * without coupling to the shared publish/consume channels managed here.
+ * Each caller is responsible for closing the returned channel when done.
+ *
+ * @returns {Promise<import('amqplib').Channel>}
+ * @throws {Error} If connect() has not been called yet.
+ */
+async function createChannel() {
+  if (!connection) {
+    throw new Error('[rabbitClient] connection not initialised — call connect() first.');
+  }
+  return connection.createChannel();
+}
+
+/**
  * Gracefully closes all AMQP channels and the connection.
  * Called during Gateway graceful shutdown in index.js.
  *
@@ -195,6 +212,7 @@ module.exports = {
   connect,
   getPublishChannel,
   getConsumeChannel,
+  createChannel,
   close,
   EXCHANGE_NAME,
   JOB_QUEUE_NAME,

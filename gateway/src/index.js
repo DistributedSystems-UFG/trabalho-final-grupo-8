@@ -18,6 +18,10 @@ const simulationBatcher = require('./simulationBatcher');
 const rabbitClient = require('./rabbitClient');
 const { startSimulationResultsConsumer } = require('./simulationResultsConsumer');
 const roomManager = require('./roomManager');
+// Import redisClient eagerly so the connection is established at boot time
+// and version key operations are ready before the first stroke arrives.
+const redisClient = require('./redisClient');
+const { INSTANCE_ID } = require('./roomBroadcastBus');
 
 const PORT = process.env.GATEWAY_PORT || 3000;
 const BATCH_FLUSH_INTERVAL_MS = Number(process.env.BATCH_FLUSH_INTERVAL_MS) || 5_000;
@@ -30,7 +34,7 @@ const server = http.createServer((_req, res) => {
 initWsServer(server);
 
 server.listen(PORT, () => {
-  console.log(`[gateway] HTTP server listening on port ${PORT}`);
+  console.log(`[gateway] HTTP server listening on port ${PORT} (instance=${INSTANCE_ID})`);
 
   // Verify the DB connection is reachable before accepting traffic.
   pool.query('SELECT 1').then(() => {
@@ -68,6 +72,7 @@ async function gracefulShutdown(signal) {
     await writeBatcher.flushAll();
     simulationBatcher.flushAll();
     await rabbitClient.close();
+    await redisClient.close();
     await pool.end();
     console.log('[gateway] PostgreSQL pool closed. Bye!');
   } catch (err) {
