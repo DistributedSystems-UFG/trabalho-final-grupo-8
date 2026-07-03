@@ -1,0 +1,15 @@
+{
+  "_comment": "Massa de teste canônica para o cenário T3 (fluxo assíncrono ponta a ponta). Cada objeto é o payload de um stroke_event conforme o contrato em docs/IMPLEMENTATION.md. Canvas 1200x600, grade 8x8 -> chunk 150x75 px. Os campos version são semeados a partir de 0 e devem ser ajustados pelo replay conforme os stroke_ack recebidos.",
+  "roomId": "sala-t3",
+  "userId": "user-replay",
+  "strokes": [
+    { "x": 640, "y": 300, "color": "#120A8F", "brushSize": 8,  "opacity": 1.0, "eraser": false, "chunkId": "4_4", "version": 0 },
+    { "x": 648, "y": 305, "color": "#120A8F", "brushSize": 8,  "opacity": 0.8, "eraser": false, "chunkId": "4_4", "version": 1 },
+    { "x": 660, "y": 310, "color": "#C81E1E", "brushSize": 12, "opacity": 1.0, "eraser": false, "chunkId": "4_4", "version": 2 },
+    { "x": 200, "y": 150, "color": "#1E8F3A", "brushSize": 6,  "opacity": 1.0, "eraser": false, "chunkId": "1_2", "version": 0 },
+    { "x": 205, "y": 152, "color": "#1E8F3A", "brushSize": 6,  "opacity": 0.5, "eraser": false, "chunkId": "1_2", "version": 1 },
+    { "x": 149, "y": 300, "color": "#8F5A00", "brushSize": 20, "opacity": 1.0, "eraser": false, "chunkId": "0_4", "version": 0, "_note": "borda direita do chunk 0_4 -> aciona difusao cross-chunk" },
+    { "x": 151, "y": 300, "color": "#8F5A00", "brushSize": 20, "opacity": 1.0, "eraser": false, "chunkId": "1_4", "version": 0, "_note": "borda esquerda do chunk 1_4 vizinho" },
+    { "x": 660, "y": 310, "color": "#FFFFFF", "brushSize": 10, "opacity": 1.0, "eraser": true,  "chunkId": "4_4", "version": 3, "_note": "borracha (destination-out) sobre a mancha vermelha" }
+  ]
+}

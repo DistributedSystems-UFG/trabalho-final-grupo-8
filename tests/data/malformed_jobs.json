@@ -1,0 +1,35 @@
+{
+  "_comment": "Massa de teste para o cenário T4 (tratamento de falhas do Worker). Publicados DIRETAMENTE na fila fluid_simulation_jobs. O Worker (consumer.py) adota uma política de DOIS NÍVEIS: (a) malformados RECONHECIDOS (json.JSONDecodeError, KeyError, UnicodeDecodeError) são logados e DESCARTADOS (ack) — NAO vao para a DLQ; (b) falhas INESPERADAS (qualquer outra excecao) propagam e caem em fluid_simulation_jobs.dlq. Cada caso tem 'raw' (bytes a publicar), 'reason' e 'expected' (drop|dlq|ok).",
+  "cases": [
+    {
+      "reason": "JSON sintaticamente invalido (chave nao fechada) -> JSONDecodeError",
+      "expected": "drop",
+      "raw": "{ \"roomId\": \"sala-dlq\", \"chunkId\": \"4_4\" "
+    },
+    {
+      "reason": "Falta o campo obrigatorio roomId -> KeyError",
+      "expected": "drop",
+      "raw": "{ \"chunkId\": \"4_4\", \"strokes\": [] }"
+    },
+    {
+      "reason": "Falta o campo obrigatorio chunkId -> KeyError",
+      "expected": "drop",
+      "raw": "{ \"roomId\": \"sala-dlq\", \"strokes\": [] }"
+    },
+    {
+      "reason": "Corpo vazio -> json.JSONDecodeError",
+      "expected": "drop",
+      "raw": ""
+    },
+    {
+      "reason": "JSON valido mas nao e objeto (string solta) -> job['roomId'] gera TypeError NAO previsto",
+      "expected": "dlq",
+      "raw": "\"isto nao e um job\""
+    },
+    {
+      "reason": "Job estruturalmente valido de CONTROLE — processado com sucesso (0 strokes)",
+      "expected": "ok",
+      "raw": "{ \"roomId\": \"sala-dlq\", \"chunkId\": \"4_4\", \"strokes\": [] }"
+    }
+  ]
+}

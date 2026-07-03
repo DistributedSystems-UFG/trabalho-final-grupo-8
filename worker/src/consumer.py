@@ -13,8 +13,15 @@ Concurrency design:
     when many large-chunk jobs arrive in a burst.
   - RabbitMQ QoS prefetch is set to ``MAX_CONCURRENT_CHUNKS`` so the broker
     only delivers as many unacknowledged messages as the Worker can handle.
-  - Failed messages are nack'd with ``requeue=False`` so they fall into the
-    dead-letter queue (DLQ) instead of cycling indefinitely.
+  - Error handling is two-tiered:
+      * *Recognised-malformed* payloads (invalid JSON, missing required keys,
+        bad encoding) are logged and **dropped (ack'd)** — they are known
+        garbage and requeuing/DLQ'ing them adds no value.
+      * *Unexpected* failures (any other exception during processing) propagate
+        out of the ``message.process(requeue=False)`` block, which nacks the
+        message so it lands in the dead-letter queue (DLQ) for investigation.
+    This keeps the DLQ signal meaningful: it holds only jobs that failed for
+    reasons we did not anticipate, never everyday malformed input.
 
 Responsibilities (SRP):
   - Listen on ``fluid_simulation_jobs``.
@@ -60,6 +67,10 @@ async def _handle_job(
     automatically nacks the message (sending it to the DLQ) if any exception
     propagates out of the block, and acks it on clean exit.
 
+    Note: recognised-malformed payloads are caught below and dropped via an
+    early ``return`` (clean exit → ack), so they are NOT sent to the DLQ. Only
+    unexpected exceptions propagate and reach the DLQ. See the module docstring.
+
     Steps:
       1. Acquire the concurrency semaphore to bound simultaneous processing.
       2. Deserialise and validate the job payload.
@@ -81,8 +92,12 @@ async def _handle_job(
                 chunk_id: str = job["chunkId"]
                 strokes: list[dict] = job.get("strokes", [])
             except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as exc:
-                # Malformed payload — nack'd by the context manager; goes to DLQ.
-                logger.error("Malformed simulation job — dropping: %s", exc)
+                # Recognised-malformed payload — log and DROP (ack). The early
+                # return exits the message.process() block cleanly, so the
+                # message is ack'd and does NOT reach the DLQ. This is
+                # intentional: the DLQ is reserved for *unexpected* failures
+                # (which propagate below), keeping its contents actionable.
+                logger.error("Malformed simulation job — dropping (ack): %s", exc)
                 return
 
             logger.info(
