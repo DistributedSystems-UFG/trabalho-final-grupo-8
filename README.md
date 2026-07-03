@@ -1,5 +1,8 @@
 # Aquarela.io
 
+Alunos: Bárbara Nogueira / Davi Duarte Neco / Matheus Vieira
+
+
 > Canvas colaborativo distribuído com simulação de fluidos em tempo real.
 
 Trabalho final da disciplina de **Software Concorrente e Distribuído**. Múltiplos usuários pintam simultaneamente no mesmo canvas enquanto um motor de simulação físico calcula a difusão da água e do pigmento em background.
