@@ -1,51 +1,66 @@
 <template>
   <!--
-    GodePalette — simulates a physical watercolour pan palette (godê).
-    Rendered as a row of round pigment pans arranged like the real object,
-    with subtle texture and selection ring inspired by a wet paint surface.
+    GodePalette — paleta de pigmentos oficial da aplicação.
+    Renderiza uma fileira de pastilhas de cor no tema escuro + um seletor de
+    cor livre (input type=color nativo, zero dependências) para escolher
+    qualquer cor fora da paleta fixa.
   -->
-  <div class="gode" role="group" aria-label="Godê de aquarela">
+  <div class="gode" role="group" aria-label="Paleta de cores">
     <button
       v-for="pigmento in godePigmentos"
       :key="pigmento.hex"
+      type="button"
       class="gode__pan"
-      :class="{ 'gode__pan--selected': pigmento.hex === modelColor }"
+      :class="{ 'gode__pan--selected': isSelected(pigmento.hex) }"
       :style="{ '--pan-color': pigmento.hex }"
       :title="pigmento.nome"
       :aria-label="`Selecionar pigmento: ${pigmento.nome}`"
-      :aria-pressed="pigmento.hex === modelColor"
+      :aria-pressed="isSelected(pigmento.hex)"
       @click="selectPigmento(pigmento.hex)"
     >
-      <!--
-        Inner disc represents the pigment cake.
-        A radial gradient from lighter centre to richer edge mimics
-        the way light catches a slightly moist watercolour pan.
-      -->
       <span class="gode__pan-disc" aria-hidden="true" />
     </button>
+
+    <!-- Divisória entre a paleta fixa e o seletor livre. -->
+    <span class="gode__divider" aria-hidden="true" />
+
+    <!--
+      Seletor de cor livre. O chip mostra a cor atual; ao clicar abre o color
+      picker nativo do navegador. Marcado como selecionado quando a cor ativa
+      não pertence à paleta fixa (i.e. é uma cor customizada).
+    -->
+    <label
+      class="gode__pan gode__pan--custom"
+      :class="{ 'gode__pan--selected': isCustomSelected }"
+      :style="{ '--pan-color': modelValue }"
+      title="Cor personalizada"
+    >
+      <span class="gode__pan-disc gode__pan-disc--custom" aria-hidden="true">+</span>
+      <input
+        type="color"
+        class="gode__color-input"
+        :value="modelValue"
+        aria-label="Escolher cor personalizada"
+        @input="selectPigmento($event.target.value)"
+      />
+    </label>
   </div>
 </template>
 
 <script setup>
 /**
  * @file GodePalette.vue
- * @description Isolated colour-selection component that simulates a real watercolour
- * godê (pan palette). It owns no drawing state — it only emits the chosen pigment
- * hex value and exposes a `modelColor` prop so the parent can bind with v-model.
+ * @description Componente de seleção de cor: paleta fixa de pigmentos + seletor
+ * de cor livre. Não possui estado de desenho — apenas emite a cor escolhida via
+ * v-model (`update:modelValue`) seguindo a convenção padrão do Vue 3.
  *
- * @emits update:modelColor - Emitted when the user selects a pigment pan.
- *   Payload: {string} hex — the hex colour string of the selected pigment.
+ * @emits update:modelValue - hex string da cor selecionada.
  *
  * @example
- * <GodePalette v-model:model-color="selectedColor" />
+ * <GodePalette v-model="selectedColor" />
  */
 
-import { defineProps, defineEmits } from 'vue';
-
-// ---------------------------------------------------------------------------
-// Pigment data — watercolour pigments chosen for layering and atmospheric
-// perspective techniques. Each pigment is transparent enough to build glazes.
-// ---------------------------------------------------------------------------
+import { computed } from 'vue';
 
 /**
  * @typedef {{ nome: string, hex: string }} Pigmento
@@ -53,82 +68,80 @@ import { defineProps, defineEmits } from 'vue';
 
 /** @type {Pigmento[]} */
 const godePigmentos = [
-  { nome: 'Azul Ultramar',          hex: '#120A8F' },
-  { nome: 'Amarelo Ocre',           hex: '#E3A857' },
-  { nome: 'Alizarin Crimson',       hex: '#E32636' },
-  { nome: 'Verde Seiva',            hex: '#507D2A' },
-  { nome: 'Cinza de Payne',         hex: '#536878' },
+  { nome: 'Azul Ultramar',           hex: '#120A8F' },
+  { nome: 'Amarelo Ocre',            hex: '#E3A857' },
+  { nome: 'Alizarin Crimson',        hex: '#E32636' },
+  { nome: 'Verde Seiva',             hex: '#507D2A' },
+  { nome: 'Cinza de Payne',          hex: '#536878' },
   { nome: 'Terra de Siena Queimada', hex: '#E97451' },
+  { nome: 'Preto Marfim',            hex: '#1C1C1C' },
 ];
-
-// ---------------------------------------------------------------------------
-// Props & emits
-// ---------------------------------------------------------------------------
 
 const props = defineProps({
   /**
-   * The currently selected pigment hex colour.
-   * Bind with `v-model:model-color` from the parent.
-   * Defaults to Azul Ultramar (#120A8F), the first pan in the godê.
+   * Cor atualmente selecionada (hex). Bind com `v-model` a partir do pai.
    * @type {string}
    */
-  modelColor: {
+  modelValue: {
     type: String,
     default: '#120A8F',
   },
 });
 
+const emit = defineEmits(['update:modelValue']);
+
+/** Conjunto (lowercase) dos hex da paleta fixa, para detectar cor custom. */
+const paletteHexes = new Set(godePigmentos.map((p) => p.hex.toLowerCase()));
+
 /**
- * @type {{ 'update:modelColor': [hex: string] }}
+ * Verdadeiro quando a cor ativa não pertence à paleta fixa — usado para
+ * marcar o chip de cor livre como selecionado.
+ * @type {import('vue').ComputedRef<boolean>}
  */
-const emit = defineEmits(['update:modelColor']);
-
-// ---------------------------------------------------------------------------
-// Actions
-// ---------------------------------------------------------------------------
+const isCustomSelected = computed(
+  () => !paletteHexes.has((props.modelValue || '').toLowerCase()),
+);
 
 /**
- * Handles a pigment pan click: emits the v-model update event so the parent
- * can update its `selectedColor` ref without any direct mutation here.
- *
- * SRP: this component knows nothing about canvas drawing or WebSocket — it
- * is purely a colour picker that follows the Vue v-model convention.
- *
- * @param {string} hex - The hex colour value of the clicked pigment pan.
+ * Compara um hex da paleta com a cor selecionada (case-insensitive).
+ * @param {string} hex
+ * @returns {boolean}
+ */
+function isSelected(hex) {
+  return hex.toLowerCase() === (props.modelValue || '').toLowerCase();
+}
+
+/**
+ * Emite a atualização de v-model quando o usuário escolhe uma cor.
+ * @param {string} hex
  */
 function selectPigmento(hex) {
-  emit('update:modelColor', hex);
+  emit('update:modelValue', hex);
 }
 </script>
 
 <style scoped>
-/* ── Godê container ────────────────────────────────────────── */
+/* ── Container da paleta ───────────────────────────────────── */
 .gode {
   display: flex;
-  gap: 0.6rem;
+  gap: 0.5rem;
   align-items: center;
-  padding: 0.55rem 0.9rem;
-  background: #e8ddd4; /* weathered ceramic / porcelain palette colour */
-  border: 1px solid #c4b8af;
-  border-radius: 999px; /* pill shape mimics a real oval palette tray */
-  box-shadow:
-    inset 0 1px 3px rgba(0, 0, 0, 0.15),
-    0 1px 2px rgba(255, 255, 255, 0.6);
+  flex-wrap: wrap;
 }
 
-/* ── Individual pan ────────────────────────────────────────── */
+/* ── Pastilha individual ───────────────────────────────────── */
 .gode__pan {
   position: relative;
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
   border-radius: 50%;
   padding: 0;
   border: none;
   cursor: pointer;
   background: transparent;
 
-  /* Selection ring — hidden by default, shown when active */
-  outline: 3px solid transparent;
+  /* Anel de seleção — transparente por padrão. */
+  outline: 2px solid transparent;
   outline-offset: 2px;
   transition: outline-color 0.15s ease, transform 0.12s ease;
 }
@@ -137,35 +150,70 @@ function selectPigmento(hex) {
   transform: scale(1.18);
 }
 
-.gode__pan--selected {
-  outline-color: #3a2e2e;
-  transform: scale(1.22);
+.gode__pan:focus-visible {
+  outline-color: var(--accent);
 }
 
-/* ── Pigment disc ──────────────────────────────────────────── */
+.gode__pan--selected {
+  outline-color: var(--accent);
+  transform: scale(1.2);
+}
+
+/* ── Disco de pigmento ─────────────────────────────────────── */
 .gode__pan-disc {
   display: block;
   width: 100%;
   height: 100%;
   border-radius: 50%;
 
-  /*
-    Radial gradient: lighter centre fades to the full pigment colour at the
-    edge, simulating a slightly moist watercolour cake under studio light.
-    The CSS custom property --pan-color is set inline per pan.
-  */
   background: radial-gradient(
     circle at 38% 35%,
-    color-mix(in srgb, var(--pan-color) 55%, #fff 45%) 0%,
+    color-mix(in srgb, var(--pan-color) 60%, #fff 40%) 0%,
     var(--pan-color) 65%,
-    color-mix(in srgb, var(--pan-color) 80%, #000 20%) 100%
+    color-mix(in srgb, var(--pan-color) 78%, #000 22%) 100%
   );
 
-  /*
-    Subtle inner shadow to give the disc a concave "pan" depth feel.
-  */
   box-shadow:
-    inset 0 2px 4px rgba(0, 0, 0, 0.25),
-    inset 0 -1px 2px rgba(255, 255, 255, 0.2);
+    inset 0 2px 4px rgba(0, 0, 0, 0.35),
+    inset 0 -1px 2px rgba(255, 255, 255, 0.18);
+}
+
+/* ── Divisória ─────────────────────────────────────────────── */
+.gode__divider {
+  width: 1px;
+  height: 24px;
+  background: var(--border);
+  margin: 0 0.15rem;
+}
+
+/* ── Seletor de cor livre ──────────────────────────────────── */
+.gode__pan--custom {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gode__pan-disc--custom {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  border: 1px dashed rgba(255, 255, 255, 0.5);
+}
+
+/* input nativo invisível cobrindo o chip — o disco é a UI visível. */
+.gode__color-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  border: none;
+  padding: 0;
 }
 </style>

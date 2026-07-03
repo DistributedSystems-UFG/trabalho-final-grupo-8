@@ -1,30 +1,70 @@
 <template>
   <div class="paint-canvas-wrapper">
-    <!-- Toolbar: godê palette (Swatches) + brush size -->
+    <!-- Toolbar: paleta própria + tamanho + opacidade + ferramenta -->
     <div class="paint-controls">
-      <!--
-        Swatches from @lk77/vue3-color is bound via a computed shim (swatchesColor)
-        that converts between the plain hex string used by useCanvas and the
-        full color object { hex, hsl, rgb, ... } that the library emits.
-      -->
-      <Swatches
-        v-model="swatchesColor"
-        :palette="PIGMENT_PALETTE"
-        class="paint-controls__swatches"
-      />
+      <!-- ── Cor ─────────────────────────────────────────── -->
+      <div class="paint-controls__group">
+        <span class="paint-controls__group-label">Cor</span>
+        <GodePalette v-model="selectedColor" />
+      </div>
 
-      <label class="paint-controls__brush-label">
-        <span>Pincel</span>
-        <input
-          type="range"
-          min="2"
-          max="32"
-          v-model.number="brushSize"
-          class="paint-controls__brush-slider"
-          aria-label="Tamanho do pincel"
-        />
-        <span class="paint-controls__brush-value">{{ brushSize }}px</span>
-      </label>
+      <span class="paint-controls__sep" aria-hidden="true" />
+
+      <!-- ── Pincel ──────────────────────────────────────── -->
+      <div class="paint-controls__group">
+        <span class="paint-controls__group-label">Pincel</span>
+        <label class="paint-controls__field">
+          <span class="paint-controls__field-name">Tamanho</span>
+          <input
+            type="range"
+            min="2"
+            max="32"
+            v-model.number="brushSize"
+            class="paint-controls__slider"
+            aria-label="Tamanho do pincel"
+          />
+          <span class="paint-controls__field-value">{{ brushSize }}px</span>
+        </label>
+        <label class="paint-controls__field">
+          <span class="paint-controls__field-name">Opacidade</span>
+          <input
+            type="range"
+            min="5"
+            max="100"
+            v-model.number="opacityPercent"
+            class="paint-controls__slider"
+            aria-label="Opacidade do pincel"
+          />
+          <span class="paint-controls__field-value">{{ opacityPercent }}%</span>
+        </label>
+      </div>
+
+      <span class="paint-controls__sep" aria-hidden="true" />
+
+      <!-- ── Ferramenta ──────────────────────────────────── -->
+      <div class="paint-controls__group">
+        <span class="paint-controls__group-label">Ferramenta</span>
+        <div class="paint-controls__tools" role="group" aria-label="Ferramenta ativa">
+          <button
+            type="button"
+            class="paint-controls__tool"
+            :class="{ 'paint-controls__tool--active': tool === 'brush' }"
+            :aria-pressed="tool === 'brush'"
+            @click="tool = 'brush'"
+          >
+            🖌 Pincel
+          </button>
+          <button
+            type="button"
+            class="paint-controls__tool"
+            :class="{ 'paint-controls__tool--active': tool === 'eraser' }"
+            :aria-pressed="tool === 'eraser'"
+            @click="tool = 'eraser'"
+          >
+            🩹 Borracha
+          </button>
+        </div>
+      </div>
     </div>
 
     <!--
@@ -49,24 +89,7 @@
 <script>
 import { defineComponent, ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useCanvas } from '../composables/useCanvas.js';
-import { Swatches } from '@lk77/vue3-color';
-
-/**
- * Watercolour pigment palette passed to the Swatches component.
- * The library expects an array of groups (inner arrays), where each group
- * is rendered as one column of colour chips. We use a single group so all
- * six pigments appear in a compact horizontal strip.
- *
- * @type {string[][]}
- */
-const PIGMENT_PALETTE = [
-  ['#120A8F'], // Azul Ultramar
-  ['#E3A857'], // Amarelo Ocre
-  ['#E32636'], // Alizarin Crimson
-  ['#507D2A'], // Verde Seiva
-  ['#536878'], // Cinza de Payne
-  ['#E97451'], // Terra de Siena Queimada
-];
+import GodePalette from './GodePalette.vue';
 
 /** Initial pigment colour — Azul Ultramar, the first pan in the godê. */
 const INITIAL_COLOR = '#120A8F';
@@ -74,10 +97,13 @@ const INITIAL_COLOR = '#120A8F';
 /** Default brush diameter in pixels. */
 const DEFAULT_BRUSH_SIZE = 8;
 
+/** Default stroke opacity (0–1). Matches the previous hard-coded watercolour look. */
+const DEFAULT_OPACITY = 0.72;
+
 export default defineComponent({
   name: 'PaintCanvas',
 
-  components: { Swatches },
+  components: { GodePalette },
 
   props: {
     /**
@@ -166,30 +192,24 @@ export default defineComponent({
      */
     const chunkVersions = reactive(new Map());
 
-    /**
-     * Computed shim that bridges the plain hex string (`selectedColor`) with the
-     * full color object `{ hex, hsl, rgb, ... }` that @lk77/vue3-color Swatches
-     * uses internally for v-model.
-     *
-     * - getter: wraps the hex string in a minimal object so Swatches can highlight
-     *   the currently selected swatch.
-     * - setter: extracts only the `.hex` field from the emitted color object and
-     *   writes it back to `selectedColor`, keeping useCanvas blissfully unaware
-     *   of the library's internal color representation.
-     *
-     * @type {import('vue').WritableComputedRef<{ hex: string }>}
-     */
-    const swatchesColor = computed({
-      get: () => ({ hex: selectedColor.value }),
-      set: (colorObj) => {
-        if (colorObj && colorObj.hex) {
-          selectedColor.value = colorObj.hex;
-        }
-      },
-    });
-
     /** @type {import('vue').Ref<number>} Currently selected brush diameter in pixels. */
     const brushSize = ref(DEFAULT_BRUSH_SIZE);
+
+    /** @type {import('vue').Ref<number>} Stroke opacity in [0, 1]. */
+    const opacity = ref(DEFAULT_OPACITY);
+
+    /**
+     * Opacity exposed to the slider as an integer percentage (5–100), bridging
+     * the 0–1 float stored in `opacity`.
+     * @type {import('vue').WritableComputedRef<number>}
+     */
+    const opacityPercent = computed({
+      get: () => Math.round(opacity.value * 100),
+      set: (pct) => { opacity.value = pct / 100; },
+    });
+
+    /** @type {import('vue').Ref<'brush'|'eraser'>} Active tool. */
+    const tool = ref('brush');
 
     /** @type {import('vue').Ref<{x:number,y:number}|null>} Last committed local stroke point. */
     const lastLocalPoint = ref(null);
@@ -275,7 +295,9 @@ export default defineComponent({
       // authoritative server version, correcting any drift.
       chunkVersions.set(chunkId, version + 1);
 
-      /** @type {{ type: string, roomId: string, userId: string, x: number, y: number, color: string, brushSize: number, timestamp: number, chunkId: string, version: number }} */
+      const isEraser = tool.value === 'eraser';
+
+      /** @type {{ type: string, roomId: string, userId: string, x: number, y: number, color: string, brushSize: number, opacity: number, eraser: boolean, timestamp: number, chunkId: string, version: number }} */
       const payload = {
         type: 'stroke_event',
         roomId: props.roomId,
@@ -284,6 +306,8 @@ export default defineComponent({
         y,
         color: selectedColor.value,
         brushSize: brushSize.value,
+        opacity: opacity.value,
+        eraser: isEraser,
         timestamp: Date.now(),
         chunkId,
         version,
@@ -297,10 +321,12 @@ export default defineComponent({
           x,
           y,
           selectedColor.value,
-          brushSize.value
+          brushSize.value,
+          opacity.value,
+          isEraser
         );
       } else {
-        drawStroke(x, y, selectedColor.value, brushSize.value);
+        drawStroke(x, y, selectedColor.value, brushSize.value, opacity.value, isEraser);
       }
       lastLocalPoint.value = { x, y };
 
@@ -517,7 +543,14 @@ export default defineComponent({
       if (message.type === 'stroke_event') {
         // Skip own echoes — already rendered optimistically on emit.
         if (message.userId === props.userId) return;
-        drawStroke(message.x, message.y, message.color, message.brushSize);
+        drawStroke(
+          message.x,
+          message.y,
+          message.color,
+          message.brushSize,
+          message.opacity ?? 1,
+          message.eraser ?? false
+        );
         // Advance the local version map so our next stroke on the same chunk
         // carries a version that accounts for the remote stroke just applied.
         if (message.chunkId && typeof message.version === 'number') {
@@ -532,7 +565,14 @@ export default defineComponent({
         // to the JSONB array in the database.
         for (const chunk of message.chunks) {
           for (const stroke of chunk.strokes) {
-            drawStroke(stroke.x, stroke.y, stroke.color, stroke.brushSize);
+            drawStroke(
+              stroke.x,
+              stroke.y,
+              stroke.color,
+              stroke.brushSize,
+              stroke.opacity ?? 1,
+              stroke.eraser ?? false
+            );
           }
           // Seed the OCC version map so the first outgoing stroke for this
           // chunk carries the correct server-authoritative version.
@@ -663,9 +703,9 @@ export default defineComponent({
     return {
       canvasRef,
       selectedColor,
-      swatchesColor,
       brushSize,
-      PIGMENT_PALETTE,
+      opacityPercent,
+      tool,
       onMouseDown,
       onMouseMove,
       onMouseUp,
@@ -683,95 +723,100 @@ export default defineComponent({
 .paint-canvas-wrapper {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.85rem;
   margin-bottom: 1.5rem;
 }
 
 /* ── Toolbar ───────────────────────────────────────────────── */
 .paint-controls {
   display: flex;
-  align-items: center;
-  gap: 1.25rem;
+  align-items: stretch;
+  gap: 1rem;
   flex-wrap: wrap;
-  padding: 0.6rem 0.75rem;
-  background: #fff;
-  border: 1px solid #d9cfc9;
-  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
 
-/* ── Swatches overrides ────────────────────────────────────── */
-/*
-  The library renders a large scrollable material-colour grid by default.
-  We constrain it to a minimal strip that shows only our 6 pigment chips.
-*/
-:deep(.vc-swatches) {
-  width: auto;
-  height: auto;
-  overflow: visible;
-  background: transparent;
-  box-shadow: none;
-  padding: 0;
-}
-
-:deep(.vc-swatches-box) {
-  display: flex;
-  flex-direction: row;
-  gap: 0.35rem;
-  padding: 0;
-  background: transparent;
-}
-
-:deep(.vc-swatches-color-group) {
+.paint-controls__group {
   display: flex;
   flex-direction: column;
-  gap: 0;
-  margin: 0;
+  gap: 0.5rem;
+  justify-content: center;
 }
 
-:deep(.vc-swatches-color-it) {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  margin: 0;
-  cursor: pointer;
-  transition: transform 0.12s ease;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.25);
+.paint-controls__group-label {
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
 }
 
-:deep(.vc-swatches-color-it:hover) {
-  transform: scale(1.18);
+.paint-controls__sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
 }
 
-:deep(.vc-swatches-color-it[aria-selected='true']) {
-  outline: 3px solid #3a2e2e;
-  outline-offset: 2px;
-  transform: scale(1.22);
-}
-
-/* Hide the checkmark SVG — the outline ring communicates selection clearly */
-:deep(.vc-swatches-pick) {
-  display: none;
-}
-
-.paint-controls__brush-label {
+/* ── Sliders (tamanho / opacidade) ─────────────────────────── */
+.paint-controls__field {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  font-size: 0.85rem;
-  color: #3a2e2e;
+  font-size: 0.8rem;
+  color: var(--text);
   white-space: nowrap;
 }
 
-.paint-controls__brush-slider {
-  width: 90px;
-  accent-color: #457b9d;
+.paint-controls__field-name {
+  min-width: 4.5rem;
+  color: var(--text-muted);
 }
 
-.paint-controls__brush-value {
+.paint-controls__slider {
+  width: 110px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.paint-controls__field-value {
   font-variant-numeric: tabular-nums;
-  min-width: 2.5rem;
-  color: #6b5c5c;
+  min-width: 2.8rem;
+  text-align: right;
+  color: var(--text);
+  font-size: 0.78rem;
+}
+
+/* ── Botões de ferramenta ──────────────────────────────────── */
+.paint-controls__tools {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.paint-controls__tool {
+  padding: 0.4rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-muted);
   font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.paint-controls__tool:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.paint-controls__tool--active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text);
 }
 
 /* ── Canvas ────────────────────────────────────────────────── */
@@ -779,9 +824,10 @@ export default defineComponent({
   display: block;
   width: 100%;
   height: 600px;
-  border: 1px solid #d9cfc9;
-  border-radius: 8px;
-  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--canvas-bg); /* branco — o chunk de desenho */
+  box-shadow: var(--shadow);
   cursor: crosshair;
   touch-action: none; /* prevents browser handling touch gestures over the canvas */
 }

@@ -150,6 +150,8 @@ async function handleJoinRoom(ws, payload, roomManager) {
  * @param {number} payload.y - Vertical canvas coordinate.
  * @param {string} payload.color - CSS hex color string.
  * @param {number} payload.brushSize - Brush radius in pixels.
+ * @param {number} [payload.opacity] - Stroke opacity in [0, 1] (defaults to 1).
+ * @param {boolean} [payload.eraser] - Whether the stroke erases pigment (defaults to false).
  * @param {number} payload.timestamp - Unix epoch milliseconds.
  * @param {string} payload.chunkId - Canvas chunk identifier (e.g. "0_0").
  * @param {number} payload.version - Client's last-known version for the chunk.
@@ -164,6 +166,13 @@ async function handleStrokeEvent(ws, payload, roomManager) {
   if (missingFields.length > 0) {
     return sendError(ws, `stroke_event is missing required fields: ${missingFields.join(', ')}.`);
   }
+
+  // Optional brush attributes (added in the Redesign). Defaulted here for
+  // backwards compatibility with pre-Redesign clients: opacity=1 (fully
+  // opaque), eraser=false (additive stroke). These are threaded through the
+  // broadcast, persistence, and simulation paths below.
+  const opacity = typeof payload.opacity === 'number' ? payload.opacity : 1;
+  const eraser = payload.eraser === true;
 
   // Treat a missing `version` field as 0 for backwards compatibility with
   // clients that pre-date Phase 5.  In a production rollout this fallback
@@ -209,7 +218,7 @@ async function handleStrokeEvent(ws, payload, roomManager) {
   // room so they also advance their chunkVersions maps.
   roomManager.broadcastToRoom(
     roomId,
-    { type: 'stroke_event', roomId, userId, x, y, color, brushSize, timestamp, chunkId, version: currentVersion },
+    { type: 'stroke_event', roomId, userId, x, y, color, brushSize, opacity, eraser, timestamp, chunkId, version: currentVersion },
     ws
   );
 
@@ -220,7 +229,7 @@ async function handleStrokeEvent(ws, payload, roomManager) {
   // Fire-and-forget: a fanout publish failure does not affect local clients
   // or persistence — only cross-instance delivery is degraded.
   roomBroadcastBus.publishToRoom(roomId, {
-    type: 'stroke_event', roomId, userId, x, y, color, brushSize, timestamp, chunkId, version: currentVersion,
+    type: 'stroke_event', roomId, userId, x, y, color, brushSize, opacity, eraser, timestamp, chunkId, version: currentVersion,
   }).catch((err) => {
     console.error(`[messageHandler] room fanout publish failed room=${roomId}: ${err.message}`);
   });
@@ -228,14 +237,14 @@ async function handleStrokeEvent(ws, payload, roomManager) {
   // Queue the accepted stroke for async persistence via the write-batcher.
   // The version is threaded through so the DB mirrors the in-memory state
   // after each flush, enabling correct hydration on Gateway restart.
-  writeBatcher.addStroke(roomId, chunkId, { x, y, color, brushSize, userId, timestamp }, currentVersion);
+  writeBatcher.addStroke(roomId, chunkId, { x, y, color, brushSize, opacity, eraser, userId, timestamp }, currentVersion);
 
   // Enqueue the stroke in the simulation batcher.  The batcher accumulates
   // strokes over a 150 ms window and publishes a single batched job to
   // RabbitMQ, reducing queue pressure from ~30 jobs/s to ~7 jobs/s.
   // Non-blocking and fire-and-forget: a publish failure here does NOT affect
   // the stroke acceptance or persistence paths.
-  simulationBatcher.addStroke(roomId, chunkId, { x, y, color, brushSize, userId, timestamp });
+  simulationBatcher.addStroke(roomId, chunkId, { x, y, color, brushSize, opacity, eraser, userId, timestamp });
 }
 
 /**

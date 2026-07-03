@@ -57,6 +57,8 @@ class Stroke(TypedDict):
     y: int
     color: str        # CSS hex string, e.g. "#120A8F"
     brushSize: int    # brush diameter in pixels
+    opacity: float    # stroke intensity in [0, 1]; defaults to 1.0 if absent
+    eraser: bool      # True removes pigment instead of adding it; defaults False
     userId: str
     timestamp: int
 
@@ -130,6 +132,9 @@ def render_strokes_onto_grid(
 
     Colour blending uses Porter-Duff **source-over** compositing so that
     semi-transparent strokes mix naturally with existing pigment on the grid.
+    The optional ``opacity`` field scales the source alpha; strokes flagged
+    with ``eraser`` use **destination-out** compositing to remove pigment
+    instead of adding it. Both fields default to opaque/non-erasing when absent.
 
     :param grid: Chunk grid of shape ``(H, W, 4)`` ``float32`` to paint onto.
     :param strokes: List of :class:`Stroke` dicts from the simulation job.
@@ -167,9 +172,30 @@ def render_strokes_onto_grid(
         yy, xx = np.meshgrid(ys, xs, indexing="ij")
         mask = (yy - local_y) ** 2 + (xx - local_x) ** 2 <= radius ** 2
 
-        # Porter-Duff source-over alpha compositing (vectorised).
-        src_a = a / 255.0
+        # Brush opacity (Redesign): scales the source alpha so translucent
+        # glazes and near-opaque strokes share this single primitive. Absent /
+        # malformed values fall back to fully opaque for backwards compatibility.
+        try:
+            opacity = float(stroke.get("opacity", 1.0))
+        except (TypeError, ValueError):
+            opacity = 1.0
+        opacity = min(1.0, max(0.0, opacity))
+
+        src_a = (a / 255.0) * opacity
         dst_a = grid[y_min:y_max, x_min:x_max, 3] / 255.0
+
+        # Eraser (Redesign): destination-out compositing removes pigment,
+        # revealing the white canvas. RGB is left untouched; only the alpha is
+        # attenuated by (1 - src_a) so the soft brush edge fades the erase.
+        if stroke.get("eraser") is True:
+            grid[y_min:y_max, x_min:x_max, 3] = np.where(
+                mask,
+                dst_a * (1.0 - src_a) * 255.0,
+                grid[y_min:y_max, x_min:x_max, 3],
+            )
+            continue
+
+        # Porter-Duff source-over alpha compositing (vectorised).
         out_a = src_a + dst_a * (1.0 - src_a)
 
         # Avoid division by zero for fully transparent regions.

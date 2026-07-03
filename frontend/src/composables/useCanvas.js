@@ -34,8 +34,8 @@ const CHUNK_GRID_SIZE = 8;
  *   canvasRef: import('vue').Ref<HTMLCanvasElement|null>,
  *   isDrawing: import('vue').Ref<boolean>,
  *   initCanvas: (el: HTMLCanvasElement) => void,
- *   drawStroke: (x: number, y: number, color: string, brushSize: number) => void,
- *   drawInterpolatedStroke: (x0: number, y0: number, x1: number, y1: number, color: string, brushSize: number) => void,
+ *   drawStroke: (x: number, y: number, color: string, brushSize: number, opacity?: number, eraser?: boolean) => void,
+ *   drawInterpolatedStroke: (x0: number, y0: number, x1: number, y1: number, color: string, brushSize: number, opacity?: number, eraser?: boolean) => void,
  *   getContext: () => CanvasRenderingContext2D|null,
  *   startStroke: () => void,
  *   continueStroke: () => void,
@@ -110,6 +110,11 @@ export function useCanvas() {
   // Drawing
   // ---------------------------------------------------------------------------
 
+  /** Alpha do centro do carimbo de pincel com opacidade máxima (opacity=1). */
+  const CORE_ALPHA = 0.72;
+  /** Alpha da borda (stop 0.7) do carimbo com opacidade máxima. */
+  const EDGE_ALPHA = 0.30;
+
   /**
    * Draws a filled circle (one brush stamp) at the given canvas coordinates.
    * This function is the single rendering primitive for both local (optimistic)
@@ -119,19 +124,35 @@ export function useCanvas() {
    * @param {number} y - Y coordinate in canvas pixels.
    * @param {string} color - CSS color string (e.g., '#e63946').
    * @param {number} brushSize - Brush diameter in pixels.
+   * @param {number} [opacity=1] - Stroke intensity multiplier in [0, 1]. Scales
+   *   the soft watercolour alpha stops so the same primitive covers translucent
+   *   glazes and near-opaque strokes.
+   * @param {boolean} [eraser=false] - When true the stamp removes pigment
+   *   (destination-out) instead of adding it (multiply), revealing the white
+   *   canvas underneath while keeping the soft brush edge.
    */
-  function drawStroke(x, y, color, brushSize) {
+  function drawStroke(x, y, color, brushSize, opacity = 1, eraser = false) {
     if (!ctx) return;
 
     const radius = Math.max(1, brushSize / 2);
-    const { r, g, b } = hexToRgb(color);
+    const clampedOpacity = Math.min(1, Math.max(0, opacity));
     const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
-    gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.72)`);
-    gradient.addColorStop(0.7, `rgba(${r}, ${g}, ${b}, 0.30)`);
-    gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+
+    if (eraser) {
+      // Eraser: alpha of the gradient controls how much pigment is cleared.
+      // The colour is irrelevant under destination-out — only alpha matters.
+      gradient.addColorStop(0, `rgba(0, 0, 0, ${CORE_ALPHA * clampedOpacity})`);
+      gradient.addColorStop(0.7, `rgba(0, 0, 0, ${EDGE_ALPHA * clampedOpacity})`);
+      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    } else {
+      const { r, g, b } = hexToRgb(color);
+      gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${CORE_ALPHA * clampedOpacity})`);
+      gradient.addColorStop(0.7, `rgba(${r}, ${g}, ${b}, ${EDGE_ALPHA * clampedOpacity})`);
+      gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+    }
 
     const previousComposite = ctx.globalCompositeOperation;
-    ctx.globalCompositeOperation = 'multiply';
+    ctx.globalCompositeOperation = eraser ? 'destination-out' : 'multiply';
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
     ctx.fillStyle = gradient;
@@ -149,8 +170,10 @@ export function useCanvas() {
    * @param {number} y1 - End Y coordinate.
    * @param {string} color - CSS color string.
    * @param {number} brushSize - Brush diameter in pixels.
+   * @param {number} [opacity=1] - Stroke intensity multiplier in [0, 1].
+   * @param {boolean} [eraser=false] - Whether this segment erases pigment.
    */
-  function drawInterpolatedStroke(x0, y0, x1, y1, color, brushSize) {
+  function drawInterpolatedStroke(x0, y0, x1, y1, color, brushSize, opacity = 1, eraser = false) {
     const dx = x1 - x0;
     const dy = y1 - y0;
     const distance = Math.hypot(dx, dy);
@@ -159,7 +182,7 @@ export function useCanvas() {
 
     for (let i = 1; i <= steps; i += 1) {
       const t = i / steps;
-      drawStroke(x0 + dx * t, y0 + dy * t, color, brushSize);
+      drawStroke(x0 + dx * t, y0 + dy * t, color, brushSize, opacity, eraser);
     }
   }
 

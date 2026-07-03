@@ -1,7 +1,7 @@
 <template>
   <div id="aquarela-app">
     <header class="app-header">
-      <h1>Aquarela.io</h1>
+      <h1>Aquarela<span class="accent">.io</span></h1>
       <div class="status-badge" :class="`status-badge--${status}`">
         {{ status }}
       </div>
@@ -177,15 +177,38 @@ export default defineComponent({
 </script>
 
 <style>
+/* ── Design tokens: tema escuro preto/vermelho ─────────────────
+   Introduzido no Redesign. O canvas de desenho permanece BRANCO
+   (--canvas-bg) para preservar o comportamento do blending. */
+:root {
+  --bg: #0d0d0f;          /* fundo quase preto da página */
+  --surface: #1a1a1f;     /* toolbar, cards, log */
+  --surface-2: #24242b;   /* elementos elevados / hover */
+  --border: #33333d;      /* bordas sutis */
+
+  --text: #f2f2f5;        /* texto principal */
+  --text-muted: #9a9aa5;  /* texto secundário */
+
+  --accent: #e11d2a;         /* vermelho de destaque */
+  --accent-hover: #b3151f;   /* vermelho pressionado */
+  --accent-soft: rgba(225, 29, 42, 0.15); /* realces translúcidos */
+
+  --canvas-bg: #ffffff;   /* o chunk de desenho permanece branco */
+
+  --radius: 10px;
+  --shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
 body {
   margin: 0;
-  font-family: sans-serif;
-  background: #f5f0eb;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
   min-height: 100vh;
 }
 
 #aquarela-app {
-  max-width: 720px;
+  max-width: 860px;
   margin: 0 auto;
   padding: 2rem 1rem;
 }
@@ -194,30 +217,52 @@ body {
   display: flex;
   align-items: center;
   gap: 1rem;
-  margin-bottom: 0.5rem;
+  margin-bottom: 1rem;
 }
 
 .app-header h1 {
   margin: 0;
-  font-size: 2rem;
-  color: #3a2e2e;
+  font-size: 2.2rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+/* Destaque em vermelho no sufixo ".io" via <span>. */
+.app-header h1 .accent {
+  color: var(--accent);
 }
 
 .status-badge {
-  padding: 0.25rem 0.75rem;
+  padding: 0.28rem 0.8rem;
   border-radius: 999px;
-  font-size: 0.8rem;
-  font-weight: 600;
+  font-size: 0.75rem;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.08em;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
 }
 
-.status-badge--connecting  { background: #fef3c7; color: #92400e; }
-.status-badge--connected   { background: #d1fae5; color: #065f46; }
-.status-badge--disconnected { background: #fee2e2; color: #991b1b; }
+/* Ponto luminoso antes do texto para reforçar o estado. */
+.status-badge::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-badge--connecting  { color: #e0a83a; border-color: #4a3a1a; }
+.status-badge--connected   { color: #3ec26b; border-color: #1c4028; }
+.status-badge--disconnected { color: var(--accent); border-color: #4a1a1e; }
 
 .phase-note {
-  color: #6b5c5c;
+  color: var(--text-muted);
   margin-bottom: 1.5rem;
 }
 
@@ -226,31 +271,40 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  padding: 0.5rem 0.9rem;
+  padding: 0.6rem 1rem;
   margin-bottom: 0.75rem;
-  border-radius: 6px;
+  border-radius: var(--radius);
   font-size: 0.9rem;
   font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--surface);
 }
 
-.join-banner--pending { background: #fef3c7; color: #92400e; }
-.join-banner--error   { background: #fee2e2; color: #991b1b; }
+.join-banner--pending { color: #e0a83a; border-color: #4a3a1a; }
+.join-banner--error   { color: var(--accent); border-color: #4a1a1e; }
 
 .join-banner__retry {
   border: none;
-  border-radius: 4px;
-  padding: 0.3rem 0.75rem;
-  background: #991b1b;
+  border-radius: 6px;
+  padding: 0.35rem 0.85rem;
+  background: var(--accent);
   color: #fff;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
+  transition: background 0.15s ease;
 }
 
-.join-banner__retry:hover { background: #7f1717; }
+.join-banner__retry:hover { background: var(--accent-hover); }
+
+.event-log {
+  margin-top: 1.5rem;
+}
 
 .event-log h2 {
-  font-size: 1rem;
-  color: #3a2e2e;
+  font-size: 0.95rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
   margin-bottom: 0.5rem;
 }
 
@@ -258,26 +312,26 @@ body {
   list-style: none;
   padding: 0;
   margin: 0;
-  border: 1px solid #d9cfc9;
-  border-radius: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
   overflow: hidden;
 }
 
 .event-log__item {
   display: flex;
   gap: 0.75rem;
-  padding: 0.4rem 0.75rem;
-  font-size: 0.85rem;
-  font-family: monospace;
-  border-bottom: 1px solid #ede8e4;
-  background: #fff;
+  padding: 0.4rem 0.85rem;
+  font-size: 0.8rem;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
 }
 
 .event-log__item:last-child { border-bottom: none; }
 
-.event-log__type   { color: #1d4ed8; min-width: 130px; }
-.event-log__detail { color: #374151; flex: 1; }
-.event-log__time   { color: #9ca3af; white-space: nowrap; }
+.event-log__type   { color: var(--accent); min-width: 130px; }
+.event-log__detail { color: var(--text); flex: 1; }
+.event-log__time   { color: var(--text-muted); white-space: nowrap; }
 
-.event-log__empty  { color: #9ca3af; font-size: 0.875rem; }
+.event-log__empty  { color: var(--text-muted); font-size: 0.875rem; }
 </style>
