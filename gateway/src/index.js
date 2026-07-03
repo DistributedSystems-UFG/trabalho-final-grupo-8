@@ -12,7 +12,7 @@ const { initWsServer } = require('./wsServer');
 
 // Eagerly require the pool so the process fails fast if env vars are missing
 // rather than silently operating without persistence.
-const { pool } = require('./db/pool');
+const { pool, readPool } = require('./db/pool');
 const writeBatcher = require('./writeBatcher');
 const simulationBatcher = require('./simulationBatcher');
 const rabbitClient = require('./rabbitClient');
@@ -38,11 +38,22 @@ server.listen(PORT, () => {
 
   // Verify the DB connection is reachable before accepting traffic.
   pool.query('SELECT 1').then(() => {
-    console.log('[gateway] PostgreSQL connection verified.');
+    console.log('[gateway] PostgreSQL primary connection verified.');
   }).catch((err) => {
-    console.error('[gateway] PostgreSQL connection failed:', err.message);
+    console.error('[gateway] PostgreSQL primary connection failed:', err.message);
     // Do not exit — the server can still serve WebSocket connections;
     // write-batcher flushes will fail and log until the DB recovers.
+  });
+
+  // Non-fatal replica check: if the read replica has not finished bootstrapping
+  // (pg_basebackup can take a moment), fetchRoomChunks falls back to the primary
+  // until it is ready, so a warning here is informational only.
+  readPool.query('SELECT 1').then(() => {
+    console.log('[gateway] PostgreSQL read-replica connection verified.');
+  }).catch((err) => {
+    console.warn(
+      `[gateway] PostgreSQL read-replica not ready (${err.message}) — reads fall back to primary.`
+    );
   });
 
   // Start the periodic write-batcher flush loop.
@@ -74,7 +85,8 @@ async function gracefulShutdown(signal) {
     await rabbitClient.close();
     await redisClient.close();
     await pool.end();
-    console.log('[gateway] PostgreSQL pool closed. Bye!');
+    await readPool.end();
+    console.log('[gateway] PostgreSQL pools closed. Bye!');
   } catch (err) {
     console.error('[gateway] error during shutdown:', err.message);
   }

@@ -120,6 +120,17 @@ export default defineComponent({
       type: String,
       required: true,
     },
+
+    /**
+     * Whether the blocking join has completed and the canvas may be painted.
+     * While false (join_room request still pending), stroke initiation is
+     * suppressed so the very first stroke always carries correct chunk versions.
+     * @type {boolean}
+     */
+    ready: {
+      type: Boolean,
+      default: true,
+    },
   },
 
   setup(props) {
@@ -342,6 +353,8 @@ export default defineComponent({
      * @param {MouseEvent} event
      */
     function onMouseDown(event) {
+      // Gate: ignore painting until the blocking join has restored canvas state.
+      if (!props.ready) return;
       startStroke();
       pendingLocalPoint.value = null;
       lastLocalPoint.value = null;
@@ -390,6 +403,8 @@ export default defineComponent({
      * @param {TouchEvent} event
      */
     function onTouchStart(event) {
+      // Gate: ignore painting until the blocking join has restored canvas state.
+      if (!props.ready) return;
       startStroke();
       pendingLocalPoint.value = null;
       lastLocalPoint.value = null;

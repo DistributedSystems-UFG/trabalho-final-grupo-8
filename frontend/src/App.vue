@@ -7,11 +7,22 @@
       </div>
     </header>
 
+    <!-- Estado do join síncrono (bloqueante): o canvas só é liberado após a
+         resposta canvas_state do servidor. -->
+    <div v-if="joining" class="join-banner join-banner--pending">
+      Entrando na sala…
+    </div>
+    <div v-else-if="joinError" class="join-banner join-banner--error">
+      <span>Falha ao entrar na sala: {{ joinError }}</span>
+      <button type="button" class="join-banner__retry" @click="joinRoom">Tentar novamente</button>
+    </div>
+
     <PaintCanvas
       :send="send"
       :last-message="lastMessage"
       :user-id="userId"
       :room-id="roomId"
+      :ready="roomReady"
     />
 
     <section class="event-log">
@@ -48,13 +59,47 @@ export default defineComponent({
   components: { PaintCanvas },
 
   setup() {
-    const { status, lastMessage, connect, send } = useWebSocket();
+    const { status, lastMessage, connect, send, sendRequest } = useWebSocket();
 
     /**
      * @type {import('vue').Ref<string>}
      * Unique user identifier generated once per session via the Web Crypto API.
      */
     const userId = ref('');
+
+    /** @type {import('vue').Ref<boolean>} True once the blocking join resolved. */
+    const roomReady = ref(false);
+
+    /** @type {import('vue').Ref<boolean>} True while the blocking join is in flight. */
+    const joining = ref(false);
+
+    /** @type {import('vue').Ref<string|null>} Error message if the join failed. */
+    const joinError = ref(null);
+
+    /**
+     * Performs the SYNCHRONOUS (blocking) join: sends `join_room` and awaits the
+     * correlated `canvas_state` reply before enabling the canvas. Contrasts with
+     * the fire-and-forget `stroke_event` path. Handles timeout/failure with a
+     * retry affordance so the UI never hangs.
+     */
+    async function joinRoom() {
+      joining.value = true;
+      joinError.value = null;
+      roomReady.value = false;
+
+      try {
+        await sendRequest(
+          { type: 'join_room', roomId: DEFAULT_ROOM_ID, userId: userId.value },
+          'canvas_state',
+        );
+        roomReady.value = true;
+      } catch (err) {
+        joinError.value = err.message;
+        console.error('[App] blocking join failed:', err.message);
+      } finally {
+        joining.value = false;
+      }
+    }
 
     /**
      * @type {import('vue').Ref<Array<{type: string, detail: string, time: string}>>}
@@ -106,10 +151,14 @@ export default defineComponent({
       }
     });
 
-    // Send join_room automatically once the connection is established.
+    // Trigger the blocking join once the connection is established (also runs on
+    // every reconnect so the canvas state is re-synced after a dropout).
     watch(status, (newStatus) => {
       if (newStatus === 'connected') {
-        send({ type: 'join_room', roomId: DEFAULT_ROOM_ID, userId: userId.value });
+        joinRoom();
+      } else {
+        // Connection lost — canvas must be re-gated until the next join resolves.
+        roomReady.value = false;
       }
     });
 
@@ -119,7 +168,10 @@ export default defineComponent({
       connect(GATEWAY_WS_URL);
     });
 
-    return { status, lastMessage, send, userId, roomId: DEFAULT_ROOM_ID, eventLog };
+    return {
+      status, lastMessage, send, userId, roomId: DEFAULT_ROOM_ID, eventLog,
+      roomReady, joining, joinError, joinRoom,
+    };
   },
 });
 </script>
@@ -168,6 +220,33 @@ body {
   color: #6b5c5c;
   margin-bottom: 1.5rem;
 }
+
+.join-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 0.9rem;
+  margin-bottom: 0.75rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.join-banner--pending { background: #fef3c7; color: #92400e; }
+.join-banner--error   { background: #fee2e2; color: #991b1b; }
+
+.join-banner__retry {
+  border: none;
+  border-radius: 4px;
+  padding: 0.3rem 0.75rem;
+  background: #991b1b;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.join-banner__retry:hover { background: #7f1717; }
 
 .event-log h2 {
   font-size: 1rem;

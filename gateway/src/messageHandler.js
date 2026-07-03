@@ -35,17 +35,32 @@ function sendError(ws, message) {
 
 /**
  * Handles a `join_room` event from a client.
- * Registers the client in the requested room and broadcasts a `client_joined`
- * notification to all existing room members.
+ *
+ * ── Interação SÍNCRONA (bloqueante) — por que aqui? ──────────────────────────
+ * Diferente do `stroke_event` (assíncrono/fire-and-forget), o join é o único
+ * ponto do sistema que exige interação remota SÍNCRONA/BLOQUEANTE, conforme a
+ * especificação: o cliente NÃO pode começar a pintar antes de conhecer o estado
+ * atual do canvas e as versões OCC de cada chunk — caso contrário a primeira
+ * pincelada carregaria versões erradas e seria rejeitada como conflito.
+ *
+ * Por isso este handler é `async` e o Gateway BLOQUEIA (await) na leitura do
+ * banco (réplica de leitura) + hidratação das versões no Redis, e só então
+ * responde uma ÚNICA mensagem `canvas_state` que serve simultaneamente de ACK
+ * do join. O cliente aguarda essa resposta (request/reply via correlationId)
+ * antes de habilitar o canvas. A leitura sai do `readPool` (réplica), unindo
+ * "leitura síncrona" + "replicação de dados" no mesmo fluxo.
  *
  * @param {WebSocket} ws - The connecting client.
  * @param {object} payload - The parsed message payload.
  * @param {string} payload.roomId - Target room identifier.
  * @param {string} payload.userId - Unique identifier of the joining user.
+ * @param {string} [payload.correlationId] - Echoed back so the client can match
+ *   this blocking request to its `canvas_state` reply.
  * @param {object} roomManager - The roomManager module instance.
+ * @returns {Promise<void>}
  */
-function handleJoinRoom(ws, payload, roomManager) {
-  const { roomId, userId } = payload;
+async function handleJoinRoom(ws, payload, roomManager) {
+  const { roomId, userId, correlationId } = payload;
 
   if (!roomId || typeof roomId !== 'string') {
     return sendError(ws, 'join_room requires a non-empty string roomId.');
@@ -69,45 +84,37 @@ function handleJoinRoom(ws, payload, roomManager) {
   // The rare race where a remote stroke arrives before subscription completes
   // is acceptable — local strokes and persistence are unaffected.
   if (clientCount === 1) {
-    roomBroadcastBus.subscribeToRoom(roomId, (payload) => {
-      roomManager.broadcastToRoom(roomId, payload);
+    roomBroadcastBus.subscribeToRoom(roomId, (busPayload) => {
+      roomManager.broadcastToRoom(roomId, busPayload);
     }).catch((err) => {
       console.error(`[gateway] room bus subscribe failed for room=${roomId}: ${err.message}`);
     });
   }
 
-  // Acknowledge the join to the requesting client.
-  ws.send(JSON.stringify({ type: 'room_joined', roomId, clientCount }));
+  // ── Caminho bloqueante: leitura de estado + hidratação de versões ──────────
+  // O `await` aqui é intencional — a resposta ao cliente só é enviada quando o
+  // estado está pronto (ver JSDoc acima).
+  const chunks = await fetchRoomChunks(roomId);
 
-  // Notify everyone else in the room.
+  // Hydrate the Redis OCC version store from the persisted DB versions.
+  // Critical on Gateway restart: without hydration, the Redis key for a chunk
+  // defaults to 0, causing clients with a non-zero version to receive spurious
+  // conflict_events on their first stroke.
+  for (const chunk of chunks) {
+    await chunkVersionManager.initChunk(roomId, chunk.chunkId, chunk.version ?? 0);
+  }
+
+  // Resposta síncrona única (ACK do join): sempre enviada, mesmo para salas
+  // novas (chunks vazios), para que a Promise bloqueante do cliente sempre
+  // resolva. Carrega `version` por chunk para semear o chunkVersions do cliente
+  // e o `correlationId` para casar request/reply.
+  ws.send(JSON.stringify({ type: 'canvas_state', roomId, clientCount, chunks, correlationId }));
+  console.log(
+    `[gateway] canvas_state (join ack) sent to user=${userId} — ${chunks.length} chunk(s) restored`
+  );
+
+  // Notify everyone else in the room (não-bloqueante para os demais).
   roomManager.broadcastToRoom(roomId, { type: 'client_joined', userId, clientCount }, ws);
-
-  // Fire-and-forget: restore canvas state for the joining client.
-  // Sent *after* room_joined so the client ACK is never blocked by a DB query.
-  // This is the correct pattern for distributed state restoration: the join
-  // confirmation is decoupled from the (potentially slow) persistence read.
-  fetchRoomChunks(roomId)
-    .then(async (chunks) => {
-      // Hydrate the Redis OCC version store from the persisted DB versions.
-      // initChunk is now async (Redis SET via Lua) — awaited sequentially here.
-      // This is critical on Gateway restart: without hydration, the Redis key
-      // for a chunk defaults to 0, causing clients with a non-zero version to
-      // receive spurious conflict_events on their first stroke.
-      for (const chunk of chunks) {
-        await chunkVersionManager.initChunk(roomId, chunk.chunkId, chunk.version ?? 0);
-      }
-
-      if (chunks.length === 0) return; // brand-new room — nothing to restore
-
-      // The canvas_state payload now carries `version` per chunk so the
-      // frontend can seed its own chunkVersions map immediately on join,
-      // enabling correct OCC payloads from the very first stroke.
-      ws.send(JSON.stringify({ type: 'canvas_state', roomId, chunks }));
-      console.log(`[gateway] canvas_state sent to user=${userId} — ${chunks.length} chunk(s) restored`);
-    })
-    .catch((err) => {
-      console.error(`[gateway] failed to fetch canvas state for room=${roomId}: ${err.message}`);
-    });
 }
 
 /**
@@ -255,7 +262,13 @@ function handleMessage(ws, rawMessage, roomManager) {
 
   switch (payload.type) {
     case 'join_room':
-      handleJoinRoom(ws, payload, roomManager);
+      // handleJoinRoom is async (blocking DB read + Redis hydration). Errors are
+      // caught here so an unhandled rejection cannot crash the process, and the
+      // client is told the blocking join failed (it can retry).
+      handleJoinRoom(ws, payload, roomManager).catch((err) => {
+        console.error(`[messageHandler] unhandled error in join_room: ${err.message}`);
+        sendError(ws, 'Internal server error joining room.');
+      });
       break;
 
     case 'stroke_event':

@@ -10,7 +10,7 @@
  * and delegates connection management to the shared pool singleton.
  */
 
-const { pool } = require('./pool');
+const { pool, readPool } = require('./pool');
 
 /**
  * Persists a batch of new strokes for a specific chunk, together with the
@@ -59,20 +59,39 @@ async function upsertChunk(roomId, chunkId, strokes, version) {
  *
  * Called during `join_room` handling to restore the full canvas state for a
  * newly connected client and to hydrate the in-memory version map.
- * Query targets the primary read-write pool; in Phase 7 this can be swapped
- * for a `readPool` without changing callers.
+ *
+ * Reads target the **read replica** (`readPool`) to offload the primary. This
+ * is the data-replication read path: writes go to the primary, reads scale out
+ * on the replica.
+ *
+ * Consistency / availability decisions:
+ *  - A réplica é assíncrona e pode ter um lag de milissegundos. Isso só afeta a
+ *    parte VISUAL (um traço recém-pintado pode faltar por um instante); a
+ *    correção do OCC NÃO é afetada, pois a hidratação de versão em
+ *    chunkVersionManager.initChunk usa max-merge no Redis — uma versão menor
+ *    vinda da réplica nunca rebaixa o valor autoritativo já avançado.
+ *  - Se a réplica estiver indisponível, faz-se fallback para o primário para
+ *    preservar a disponibilidade da funcionalidade de restauração de canvas.
  *
  * @param {string} roomId - Room whose chunks should be fetched.
  * @returns {Promise<Array<{ chunkId: string, strokes: object[], version: number }>>}
  *   An array of chunk objects, each carrying the full stroke history and version.
  */
 async function fetchRoomChunks(roomId) {
-  const result = await pool.query(
-    `SELECT chunk_id AS "chunkId", pixel_data AS strokes, version
+  const query = `SELECT chunk_id AS "chunkId", pixel_data AS strokes, version
      FROM canvas_chunks
-     WHERE room_id = $1`,
-    [roomId]
-  );
+     WHERE room_id = $1`;
+
+  let result;
+  try {
+    result = await readPool.query(query, [roomId]);
+  } catch (err) {
+    // Fallback de disponibilidade: réplica fora do ar → lê do primário.
+    console.warn(
+      `[chunkRepository] replica read failed (${err.message}) — falling back to primary.`
+    );
+    result = await pool.query(query, [roomId]);
+  }
 
   // node-postgres returns BIGINT columns as strings to avoid JavaScript's
   // 53-bit integer precision limit.  We coerce to Number here because our

@@ -9,19 +9,41 @@
 
 services:
 
-  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  # ── PostgreSQL (Primary / read-write) ───────────────────────────────────────
+  # Primary node for streaming replication. Escritas (upserts de chunks) vão
+  # sempre para cá; a réplica (postgres-replica) recebe o WAL e serve os SELECTs
+  # de restauração de canvas — satisfazendo "Replicação de dados" da spec.
   postgres:
     image: postgres:16-alpine
     container_name: aquarela-postgres
     restart: unless-stopped
+    # Flags de replicação física: habilitam WAL senders e hot standby para que
+    # a réplica possa fazer streaming a partir deste primário.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "listen_addresses=*"
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Credenciais da role de replicação criada por 02-setup-replication.sh.
+      POSTGRES_REPLICATION_USER: ${POSTGRES_REPLICATION_USER}
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # SQL init scripts are run once on first container creation
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      # Cria a role de replicação e libera o pg_hba para conexões de replicação.
+      - ./infra/postgres/02-setup-replication.sh:/docker-entrypoint-initdb.d/02-setup-replication.sh:ro
     ports:
       - "5432:5432"
     networks:
@@ -32,6 +54,40 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # ── PostgreSQL (Replica / read-only) ────────────────────────────────────────
+  # Standby em hot_standby: recebe o WAL do primário via streaming e responde
+  # apenas leituras. O Gateway usa esta réplica para fetchRoomChunks (readPool),
+  # com fallback automático para o primário se ela estiver indisponível.
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: aquarela-postgres-replica
+    restart: unless-stopped
+    # Precisa iniciar como root para ajustar owner/perms do PGDATA antes de
+    # rodar o pg_basebackup como usuário postgres (ver replica-entrypoint.sh).
+    user: root
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PRIMARY_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPLICATION_USER: ${POSTGRES_REPLICATION_USER}
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD}
+    entrypoint: ["bash", "/usr/local/bin/replica-entrypoint.sh"]
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./infra/postgres/replica-entrypoint.sh:/usr/local/bin/replica-entrypoint.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - aquarela-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   # ── RabbitMQ ────────────────────────────────────────────────────────────────
   rabbitmq:
@@ -105,6 +161,8 @@ services:
     environment:
       NODE_ENV: ${NODE_ENV}
       REDIS_URL: ${REDIS_URL}
+      # Host da réplica de leitura consumida pelo readPool (fetchRoomChunks).
+      POSTGRES_READ_HOST: ${POSTGRES_READ_HOST}
     networks:
       - aquarela-net
     depends_on:
@@ -158,6 +216,7 @@ services:
 # ── Named Volumes ──────────────────────────────────────────────────────────────
 volumes:
   postgres_data:
+  postgres_replica_data:
   rabbitmq_data:
   redis_data:
 

@@ -4,8 +4,9 @@
  * including automatic reconnection with exponential backoff and jitter.
  *
  * Usage:
- *   const { status, lastMessage, connect, send, disconnect } = useWebSocket();
+ *   const { status, lastMessage, connect, send, sendRequest, disconnect } = useWebSocket();
  *   connect('ws://localhost:3000');
+ *   const state = await sendRequest({ type: 'join_room', roomId, userId }, 'canvas_state');
  *
  * Reconnection strategy:
  *   - Attempts reconnect on unexpected close (not triggered by `disconnect()`).
@@ -48,6 +49,7 @@ function calculateBackoffDelay(attempt) {
  *   lastMessage: import('vue').Ref<object|null>,
  *   connect: (url: string) => void,
  *   send: (payload: object) => void,
+ *   sendRequest: (payload: object, responseType: string, options?: { timeoutMs?: number }) => Promise<object>,
  *   disconnect: () => void,
  * }}
  */
@@ -72,6 +74,28 @@ export function useWebSocket() {
 
   /** @type {boolean} Prevents reconnection when `disconnect()` is called intentionally. */
   let intentionalClose = false;
+
+  /**
+   * In-flight synchronous requests awaiting a correlated reply.
+   * Keyed by correlationId → { resolve, reject, timer, responseType }.
+   *
+   * @type {Map<string, { resolve: Function, reject: Function, timer: ReturnType<typeof setTimeout>, responseType: string }>}
+   */
+  const pendingRequests = new Map();
+
+  /**
+   * Rejects and clears every pending request — called when the socket closes so
+   * blocking callers (e.g. the join flow) fail fast instead of hanging forever.
+   *
+   * @param {string} reason - Human-readable rejection reason.
+   */
+  function rejectAllPending(reason) {
+    for (const [, entry] of pendingRequests) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error(reason));
+    }
+    pendingRequests.clear();
+  }
 
   /**
    * Clears any pending reconnection timer.
@@ -118,16 +142,39 @@ export function useWebSocket() {
     });
 
     socket.addEventListener('message', (event) => {
+      let data;
       try {
-        lastMessage.value = JSON.parse(event.data);
+        data = JSON.parse(event.data);
       } catch {
         console.warn('[useWebSocket] received non-JSON message:', event.data);
+        return;
       }
+
+      // Resolve a matching blocking request (request/reply via correlationId).
+      // We still fall through to update lastMessage so existing reactive
+      // watchers (e.g. PaintCanvas seeding chunkVersions from canvas_state)
+      // keep working unchanged.
+      if (data.correlationId && pendingRequests.has(data.correlationId)) {
+        const entry = pendingRequests.get(data.correlationId);
+        if (data.type === entry.responseType) {
+          clearTimeout(entry.timer);
+          pendingRequests.delete(data.correlationId);
+          entry.resolve(data);
+        } else if (data.type === 'error') {
+          clearTimeout(entry.timer);
+          pendingRequests.delete(data.correlationId);
+          entry.reject(new Error(data.message || 'request failed'));
+        }
+      }
+
+      lastMessage.value = data;
     });
 
     socket.addEventListener('close', (event) => {
       status.value = 'disconnected';
       console.log(`[useWebSocket] connection closed (code=${event.code}, wasClean=${event.wasClean})`);
+      // Blocking callers must not hang across a disconnect.
+      rejectAllPending('WebSocket disconnected before a reply was received.');
       scheduleReconnect();
     });
 
@@ -165,11 +212,48 @@ export function useWebSocket() {
   }
 
   /**
+   * Sends a request and returns a Promise that resolves with the correlated
+   * reply — a genuinely SYNCHRONOUS (blocking) remote interaction from the
+   * caller's perspective, in contrast to the fire-and-forget `send`.
+   *
+   * A `correlationId` is generated and injected into the payload; the server
+   * echoes it back on the reply, letting us match request↔response even with
+   * multiple requests in flight. The Promise:
+   *   - resolves when a message of type `responseType` with the same
+   *     correlationId arrives;
+   *   - rejects on `error` reply, on timeout, or if the socket disconnects.
+   *
+   * @param {object} payload - Message to send (a `type` field is expected).
+   * @param {string} responseType - The `type` of the awaited reply message.
+   * @param {{ timeoutMs?: number }} [options] - Optional timeout (default 5000ms).
+   * @returns {Promise<object>} Resolves with the parsed reply message.
+   */
+  function sendRequest(payload, responseType, { timeoutMs = 5000 } = {}) {
+    return new Promise((resolve, reject) => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        reject(new Error('cannot send request — socket is not open'));
+        return;
+      }
+
+      const correlationId = crypto.randomUUID();
+
+      const timer = setTimeout(() => {
+        pendingRequests.delete(correlationId);
+        reject(new Error(`request '${payload.type}' timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      pendingRequests.set(correlationId, { resolve, reject, timer, responseType });
+      socket.send(JSON.stringify({ ...payload, correlationId }));
+    });
+  }
+
+  /**
    * Intentionally closes the WebSocket connection and prevents auto-reconnect.
    */
   function disconnect() {
     intentionalClose = true;
     clearReconnectTimer();
+    rejectAllPending('WebSocket disconnected intentionally.');
 
     if (socket) {
       socket.close();
@@ -184,5 +268,5 @@ export function useWebSocket() {
     disconnect();
   });
 
-  return { status, lastMessage, connect, send, disconnect };
+  return { status, lastMessage, connect, send, sendRequest, disconnect };
 }

@@ -21,7 +21,9 @@ O sistema é composto por três blocos principais, interligados por mensageria, 
 
 ## 3. Tratamento de Sistemas Distribuídos
 
-- **Comunicação Síncrona/Assíncrona:** O cliente envia a ação de pintar e aguarda a confirmação de registro (Síncrono). A visualização do espalhamento da tinta ao longo dos segundos seguintes chega via WebSockets (Assíncrono).
-- **Publish-Subscribe (Mensageria):** O Node.js e o Python se comunicam através de um *Message Broker* (ex: RabbitMQ).
+- **Comunicação Síncrona (bloqueante):** Ao entrar numa sala, o cliente faz um `join_room` e **bloqueia** aguardando a resposta `canvas_state` (request/reply correlacionado por `correlationId`). O Gateway só responde após ler o estado do canvas no banco e hidratar as versões OCC no Redis; o canvas só é habilitado depois disso. Implementação: `gateway/src/messageHandler.js` (`handleJoinRoom`) e `frontend/src/composables/useWebSocket.js` (`sendRequest`).
+- **Comunicação Assíncrona:** As pinceladas (`stroke_event`) são fire-and-forget e o espalhamento da tinta chega depois via `pixel_update` (WebSocket), calculado pelo Worker via RabbitMQ.
+- **Publish-Subscribe (Mensageria):** O Node.js e o Python se comunicam através de um *Message Broker* (RabbitMQ). Entre réplicas do Gateway, o broadcast por sala usa exchanges `fanout` (`roomBroadcastBus.js`).
 - **Particionamento de Dados:** O Canvas é logicamente dividido em "Chunks" (Quadrantes). Cada região da tela pode ser processada independentemente para escalar horizontalmente.
-- **Replicação e Disponibilidade:** O estado consolidado dos pixels é salvo periodicamente em réplicas de banco de dados. Caso o Gateway caia, a última versão do Canvas é restaurada do banco.
+- **Replicação de Dados (streaming replication):** O PostgreSQL roda como **primário + réplica read-only** (serviço `postgres-replica` no `docker-compose.yml`, via `pg_basebackup` + WAL streaming). As **escritas** (upsert de chunks) vão ao primário; as **leituras** de restauração de canvas (`fetchRoomChunks`) saem da réplica através do `readPool` (`gateway/src/db/pool.js`), com **fallback automático para o primário** se a réplica estiver indisponível (disponibilidade). A hidratação de versões OCC usa *max-merge* no Redis, então o lag assíncrono da réplica não corrompe a concorrência.
+- **Replicação de Funcionalidade e Disponibilidade:** O Gateway roda com 3 réplicas atrás do Nginx; se uma cai, os clientes reconectam e o Canvas é restaurado do banco.
