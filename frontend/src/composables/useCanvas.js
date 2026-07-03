@@ -76,14 +76,38 @@ export function useCanvas() {
       ? el.parentElement.clientWidth
       : el.clientWidth;
 
-    el.width = containerWidth || 800;
-    el.height = CANVAS_HEIGHT_PX;
+    const newWidth = containerWidth || 800;
+    const newHeight = CANVAS_HEIGHT_PX;
+
+    // Bail out when dimensions are already correct.
+    // Setting canvas.width/height always clears the bitmap (HTML5 spec), so
+    // assigning the same value would erase all painted content on every
+    // incidental layout change (sidebar toggle, scrollbar, etc.).
+    if (el.width === newWidth && el.height === newHeight) return;
+
+    // Snapshot the current bitmap before the resize clears it.
+    const resizeCtx = el.getContext('2d');
+    let snapshot = null;
+    if (resizeCtx && el.width > 0 && el.height > 0) {
+      try {
+        snapshot = resizeCtx.getImageData(0, 0, el.width, el.height);
+      } catch {
+        // getImageData can throw on cross-origin canvases; treat as no snapshot.
+      }
+    }
+
+    el.width = newWidth;
+    el.height = newHeight;
 
     // Keep an opaque light paper base so multiply blending behaves predictably.
-    const resizedCtx = el.getContext('2d');
-    if (resizedCtx) {
-      resizedCtx.fillStyle = '#ffffff';
-      resizedCtx.fillRect(0, 0, el.width, el.height);
+    if (resizeCtx) {
+      resizeCtx.fillStyle = '#ffffff';
+      resizeCtx.fillRect(0, 0, el.width, el.height);
+
+      // Restore the previous canvas content on top of the white base.
+      if (snapshot) {
+        resizeCtx.putImageData(snapshot, 0, 0);
+      }
     }
   }
 

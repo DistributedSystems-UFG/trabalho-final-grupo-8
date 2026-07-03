@@ -226,6 +226,18 @@ export default defineComponent({
     /** @type {number|null} Active RAF id for websocket message draining loop. */
     let messageFrameId = null;
 
+    /**
+     * Strokes from a canvas_state replay waiting to be drawn in batches.
+     * Populated when a canvas_state message arrives; drained N strokes per frame
+     * in the RAF tick so the main thread is never blocked for long tasks.
+     *
+     * @type {Array<{x:number,y:number,color:string,brushSize:number,opacity?:number,eraser?:boolean}>}
+     */
+    let pendingReplayStrokes = [];
+
+    /** Maximum strokes drawn per animation frame during canvas_state replay. */
+    const REPLAY_BATCH_SIZE = 50;
+
     // -------------------------------------------------------------------------
     // Coordinate helpers
     // -------------------------------------------------------------------------
@@ -492,6 +504,10 @@ export default defineComponent({
         && pixel.y >= 0
         && pixel.x < canvas.width
         && pixel.y < canvas.height
+        // Discard near-transparent pixels: diffusion alpha-decay can produce
+        // pixels with a ≈ 0 that would overwrite user strokes with blank pixels,
+        // creating visible white blocks on the canvas.
+        && pixel.a >= 5
       ));
 
       if (validPixels.length === 0) return;
@@ -560,24 +576,22 @@ export default defineComponent({
       }
 
       if (message.type === 'canvas_state') {
-        // Re-play every persisted stroke to reconstruct the canvas state.
+        // Seed the OCC version map immediately so the user can start painting
+        // while the historical strokes are still being replayed in the background.
+        for (const chunk of message.chunks) {
+          if (typeof chunk.version === 'number') {
+            chunkVersions.set(chunk.chunkId, chunk.version);
+          }
+        }
+
+        // Instead of replaying all strokes synchronously (which blocks the main
+        // thread for seconds on large canvases), flatten them into a queue that
+        // is drained REPLAY_BATCH_SIZE strokes per animation frame.
         // Ordering is preserved because strokes were appended sequentially
         // to the JSONB array in the database.
         for (const chunk of message.chunks) {
           for (const stroke of chunk.strokes) {
-            drawStroke(
-              stroke.x,
-              stroke.y,
-              stroke.color,
-              stroke.brushSize,
-              stroke.opacity ?? 1,
-              stroke.eraser ?? false
-            );
-          }
-          // Seed the OCC version map so the first outgoing stroke for this
-          // chunk carries the correct server-authoritative version.
-          if (typeof chunk.version === 'number') {
-            chunkVersions.set(chunk.chunkId, chunk.version);
+            pendingReplayStrokes.push(stroke);
           }
         }
         return;
@@ -625,6 +639,23 @@ export default defineComponent({
       if (messageFrameId !== null) return;
 
       const tick = () => {
+        // Drain a bounded slice of the canvas_state replay queue first.
+        // Processing a fixed number of strokes per frame keeps the main thread
+        // responsive during the initial state replay on room join.
+        if (pendingReplayStrokes.length > 0) {
+          const replayBatch = pendingReplayStrokes.splice(0, REPLAY_BATCH_SIZE);
+          for (const stroke of replayBatch) {
+            drawStroke(
+              stroke.x,
+              stroke.y,
+              stroke.color,
+              stroke.brushSize,
+              stroke.opacity ?? 1,
+              stroke.eraser ?? false
+            );
+          }
+        }
+
         if (messageQueue.value.length > 0) {
           const batch = messageQueue.value.splice(0, messageQueue.value.length);
           for (const message of batch) {
@@ -646,6 +677,7 @@ export default defineComponent({
         messageFrameId = null;
       }
       messageQueue.value = [];
+      pendingReplayStrokes = [];
     }
 
     // -------------------------------------------------------------------------

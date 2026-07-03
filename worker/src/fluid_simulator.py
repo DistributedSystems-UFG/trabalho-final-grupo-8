@@ -301,13 +301,23 @@ def extract_changed_pixels(
     changed_pixels: list[ChangedPixel] = []
     for local_y, local_x in zip(changed_ys.tolist(), changed_xs.tolist()):
         r, g, b, a = diffused_grid[local_y, local_x]
+        a_int = int(round(float(a)))
+
+        # Skip near-transparent pixels: alpha_decay can drive the alpha channel
+        # to values close to zero.  Sending these to the frontend would overwrite
+        # user-painted pixels with transparent ones, producing white blocks.
+        # A threshold of 5 is imperceptible to the human eye but eliminates the
+        # ghost-erase artefact.
+        if a_int < 5:
+            continue
+
         changed_pixels.append({
             "x": local_x + chunk_origin_x,
             "y": local_y + chunk_origin_y,
             "r": int(round(float(r))),
             "g": int(round(float(g))),
             "b": int(round(float(b))),
-            "a": int(round(float(a))),
+            "a": a_int,
         })
 
     return changed_pixels
